@@ -1,0 +1,42 @@
+{
+  "name": "openclaw-browser-automation",
+  "version": "1.0.0",
+  "description": "高性能浏览器自动化平台，基于Chrome DevTools Protocol，为AI Agents提供稳定的多并发浏览器控制能力",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "cdp-service",
+    "mcp-server"
+  ],
+  "scripts": {
+    "install:all": "npm install && cd cdp-service && npm install && cd ../mcp-server && npm install",
+    "build:cdp": "cd cdp-service && npm run build",
+    "start:cdp": "cd cdp-service && npm start",
+    "start:mcp": "cd mcp-server && npm start",
+    "test": "cd cdp-service && npm test",
+    "test:load": "cd cdp-service && ./test-load.sh",
+    "test:comprehensive": "cd cdp-service && ./test-comprehensive.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:CACppuccino/browser-automation.git"
+  },
+  "keywords": [
+    "browser-automation",
+    "cdp",
+    "chrome-devtools-protocol",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "playwright",
+    "selenium",
+    "web-automation"
+  ],
+  "author": "OpenClaw Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "devDependencies": {},
+  "dependencies": {}
+}

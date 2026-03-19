@@ -1,0 +1,32 @@
+# CDP Service Configuration
+service:
+  host: 127.0.0.1
+  port: 3100
+  authToken: ${CDP_SERVICE_TOKEN}
+
+isolation:
+  strategy: dynamic          # static | dynamic
+  default: context           # process | context | session
+  rules:
+    - pattern: "agent-.*"
+      level: context
+    - pattern: "heavy-.*"
+      level: process
+
+cdp:
+  endpoints:
+    - url: http://localhost:9222
+      weight: 1
+  connectionPool:
+    maxPerEndpoint: 10
+    idleTimeoutMs: 300000    # 5 minutes
+
+timeouts:
+  defaultBudgetMs: 30000     # 30 seconds
+  maxBudgetMs: 120000        # 2 minutes
+  gracefulTerminationMs: 5000
+
+monitoring:
+  metricsPort: 3101
+  logLevel: info
+  enableTracing: false

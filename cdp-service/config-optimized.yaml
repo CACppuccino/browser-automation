@@ -1,0 +1,51 @@
+# CDP Service Configuration - Performance Optimized
+service:
+  host: 127.0.0.1
+  port: 3100
+  authToken: ${CDP_SERVICE_TOKEN}
+
+isolation:
+  strategy: dynamic          # static | dynamic
+  default: context           # process | context | session
+  rules:
+    - pattern: "agent-.*"
+      level: context
+    - pattern: "heavy-.*"
+      level: process
+  # Performance tuning
+  thresholds:
+    highLoadSessionCount: 50      # Increased from 10
+    highLoadCpuPercent: 80        # Increased from 70%
+    highLoadMemoryPercent: 85     # Increased from 80%
+
+cdp:
+  endpoints:
+    - url: http://localhost:9222
+      weight: 1
+  connectionPool:
+    maxPerEndpoint: 100           # Increased from 10 for high concurrency
+    minIdleConnections: 10        # NEW: Keep warm connections ready
+    idleTimeoutMs: 300000         # 5 minutes
+    connectTimeoutMs: 10000       # NEW: 10s connection timeout
+    maxRetries: 3                 # NEW: Retry failed connections
+    retryDelayMs: 100             # NEW: Delay between retries
+
+timeouts:
+  defaultBudgetMs: 30000          # 30 seconds
+  maxBudgetMs: 120000             # 2 minutes
+  gracefulTerminationMs: 5000
+  queueTimeoutMs: 15000           # NEW: Max time in queue
+
+monitoring:
+  metricsPort: 3101
+  logLevel: info
+  enableTracing: false
+
+# NEW: Resource limits
+limits:
+  maxConcurrentEvaluations: 100   # Hard limit on concurrent evals
+  maxQueueSize: 500               # Max queued requests
+  enginePoolSize:
+    process: 20                    # Max process-level engines
+    context: 50                    # Max context-level engines
+    session: 100                   # Max session-level engines

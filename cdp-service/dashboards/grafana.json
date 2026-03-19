@@ -1,0 +1,244 @@
+{
+  "dashboard": {
+    "title": "OpenClaw CDP Service Monitoring",
+    "tags": ["cdp", "openclaw", "browser", "monitoring"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "type": "graph",
+        "title": "Evaluate Requests Rate",
+        "targets": [
+          {
+            "expr": "rate(cdp_evaluate_total[5m])",
+            "legendFormat": "{{status}} - {{isolation_level}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "reqps",
+            "label": "Requests/sec"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+        "type": "graph",
+        "title": "Evaluate Duration (P50/P95/P99)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, rate(cdp_evaluate_duration_ms_bucket[5m]))",
+            "legendFormat": "P50",
+            "refId": "A"
+          },
+          {
+            "expr": "histogram_quantile(0.95, rate(cdp_evaluate_duration_ms_bucket[5m]))",
+            "legendFormat": "P95",
+            "refId": "B"
+          },
+          {
+            "expr": "histogram_quantile(0.99, rate(cdp_evaluate_duration_ms_bucket[5m]))",
+            "legendFormat": "P99",
+            "refId": "C"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "ms",
+            "label": "Duration"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "gridPos": { "h": 6, "w": 6, "x": 0, "y": 8 },
+        "type": "stat",
+        "title": "Active CDP Connections",
+        "targets": [
+          {
+            "expr": "cdp_active_connections",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 10, "color": "yellow" },
+                { "value": 50, "color": "red" }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": { "h": 6, "w": 6, "x": 6, "y": 8 },
+        "type": "stat",
+        "title": "Active Sessions",
+        "targets": [
+          {
+            "expr": "sum(cdp_active_sessions)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 20, "color": "yellow" },
+                { "value": 100, "color": "red" }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 5,
+        "gridPos": { "h": 6, "w": 6, "x": 12, "y": 8 },
+        "type": "stat",
+        "title": "Active Engines",
+        "targets": [
+          {
+            "expr": "sum(cdp_active_engines)",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 20, "color": "yellow" },
+                { "value": 100, "color": "red" }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 6,
+        "gridPos": { "h": 6, "w": 6, "x": 18, "y": 8 },
+        "type": "stat",
+        "title": "Timeout Rate",
+        "targets": [
+          {
+            "expr": "rate(cdp_timeouts_total[5m])",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "mappings": [],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 0.1, "color": "yellow" },
+                { "value": 1, "color": "red" }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 7,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+        "type": "graph",
+        "title": "Error Rate by Type",
+        "targets": [
+          {
+            "expr": "rate(cdp_errors_total[5m])",
+            "legendFormat": "{{error_type}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "errps",
+            "label": "Errors/sec"
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+        "type": "graph",
+        "title": "Queue Size by Target",
+        "targets": [
+          {
+            "expr": "cdp_queue_size",
+            "legendFormat": "{{target_id}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "short",
+            "label": "Queue Size"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+        "type": "graph",
+        "title": "Queue Wait Duration",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(cdp_queue_wait_duration_ms_bucket[5m]))",
+            "legendFormat": "P95 - {{target_id}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "ms",
+            "label": "Wait Duration"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+        "type": "graph",
+        "title": "Evaluate Requests by Isolation Level",
+        "targets": [
+          {
+            "expr": "rate(cdp_evaluate_total{status=\"success\"}[5m])",
+            "legendFormat": "{{isolation_level}}",
+            "refId": "A"
+          }
+        ],
+        "yaxes": [
+          {
+            "format": "reqps",
+            "label": "Requests/sec"
+          }
+        ]
+      }
+    ],
+    "templating": {
+      "list": []
+    },
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}
