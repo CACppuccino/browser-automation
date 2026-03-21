@@ -246,9 +246,13 @@ export class CdpEvaluateEngine {
 
     // Execute evaluation
     const result = await sendWithBudget<{
-      result?: { value?: unknown };
+      result?: { value?: unknown; description?: string; type?: string };
       exceptionDetails?: {
         text: string;
+        exception?: {
+          description?: string;
+          value?: unknown;
+        };
         lineNumber?: number;
         columnNumber?: number;
         stackTrace?: unknown;
@@ -269,12 +273,19 @@ export class CdpEvaluateEngine {
 
     if (result.exceptionDetails) {
       const error: EvaluateResponse['exceptionDetails'] = {
-        text: result.exceptionDetails.text || 'Evaluation exception',
+        text:
+          result.exceptionDetails.exception?.description ||
+          result.exceptionDetails.text ||
+          'Evaluation exception',
         lineNumber: result.exceptionDetails.lineNumber,
         columnNumber: result.exceptionDetails.columnNumber,
         stackTrace: result.exceptionDetails.stackTrace,
       };
-      throw new Error(error.text);
+      const location =
+        error.lineNumber !== undefined && error.columnNumber !== undefined
+          ? ` at ${error.lineNumber}:${error.columnNumber}`
+          : '';
+      throw new Error(`${error.text}${location}`);
     }
 
     return result.result?.value;

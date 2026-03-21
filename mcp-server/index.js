@@ -264,32 +264,83 @@ function literal(value) {
   return JSON.stringify(String(value));
 }
 
-function buildNavigateExpression(url, waitForLoad) {
+function buildStartNavigateExpression(url) {
   const serializedUrl = literal(url);
-  if (waitForLoad !== false) {
-    return `
-      await new Promise((resolve, reject) => {
-        const nextUrl = ${serializedUrl};
-        const timeout = setTimeout(() => reject(new Error('Navigation timeout')), 10000);
-        const done = () => {
-          clearTimeout(timeout);
-          window.removeEventListener('load', done);
-          resolve();
-        };
-        window.addEventListener('load', done, { once: true });
+  return `
+    (() => {
+      const nextUrl = ${serializedUrl};
+      window.setTimeout(() => {
         window.location.href = nextUrl;
-        if (document.readyState === 'complete' && window.location.href === nextUrl) {
-          done();
-        }
-      });
-      ({ url: window.location.href, title: document.title });
-    `;
+      }, 0);
+      return {
+        scheduled: true,
+        requestedUrl: nextUrl,
+        previousUrl: window.location.href
+      };
+    })()
+  `;
+}
+
+function buildPageStateExpression() {
+  return `
+    ({
+      url: window.location.href,
+      title: document.title,
+      readyState: document.readyState
+    })
+  `;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeComparablePath(pathname) {
+  if (!pathname || pathname === '/') {
+    return '/';
   }
 
-  return `
-    window.location.href = ${serializedUrl};
-    ({ url: window.location.href, title: document.title });
-  `;
+  return pathname.endsWith('/') ? pathname.slice(0, -1) || '/' : pathname;
+}
+
+function urlMatchesTarget(currentUrl, requestedUrl) {
+  if (currentUrl === requestedUrl || currentUrl.startsWith(requestedUrl)) {
+    return true;
+  }
+
+  try {
+    const current = new URL(currentUrl);
+    const requested = new URL(requestedUrl);
+
+    if (current.origin !== requested.origin) {
+      return false;
+    }
+
+    const currentPath = normalizeComparablePath(current.pathname);
+    const requestedPath = normalizeComparablePath(requested.pathname);
+
+    if (requestedPath === '/') {
+      return true;
+    }
+
+    return currentPath === requestedPath;
+  } catch {
+    return currentUrl === requestedUrl;
+  }
+}
+
+function isTransientEvaluationError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return [
+    'Execution context was destroyed',
+    'Cannot find context with specified id',
+    'Inspected target navigated or closed',
+    'No frame with given id',
+    'Target closed',
+    'Session closed',
+    'CDP Service error: Uncaught',
+    'Error: Uncaught',
+  ].some((pattern) => message.includes(pattern));
 }
 
 function buildClickExpression(selector) {
@@ -398,6 +449,61 @@ async function evaluateWithBrowserMode(args, expression, timeoutMs, extra = {}) 
   });
 }
 
+async function waitForNavigationResult(args, requestedUrl, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastState;
+  let transientFailures = 0;
+
+  while (Date.now() < deadline) {
+    try {
+      const snapshot = await evaluateWithBrowserMode(
+        args,
+        buildPageStateExpression(),
+        Math.max(1000, Math.min(5000, deadline - Date.now())),
+        {
+          awaitPromise: false,
+        }
+      );
+      lastState = snapshot.result;
+
+      if (
+        lastState &&
+        typeof lastState.url === 'string' &&
+        urlMatchesTarget(lastState.url, requestedUrl) &&
+        lastState.readyState === 'complete'
+      ) {
+        return lastState;
+      }
+    } catch (error) {
+      if (!isTransientEvaluationError(error)) {
+        throw error;
+      }
+      transientFailures += 1;
+    }
+
+    await sleep(250);
+  }
+
+  const details = lastState ? ` Last state: ${JSON.stringify(lastState)}` : '';
+  const transientNote = transientFailures > 0 ? ` Transient errors: ${transientFailures}.` : '';
+  throw new Error(`Navigation timeout waiting for ${requestedUrl}.${transientNote}${details}`);
+}
+
+async function navigateWithBrowserMode(args) {
+  const requestedUrl = String(args.url);
+  const timeoutMs = 10000;
+
+  await evaluateWithBrowserMode(args, buildStartNavigateExpression(requestedUrl), timeoutMs, {
+    awaitPromise: false,
+  });
+
+  if (args.waitForLoad === false) {
+    return { url: requestedUrl };
+  }
+
+  return waitForNavigationResult(args, requestedUrl, timeoutMs);
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
@@ -422,16 +528,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_navigate': {
-        const result = await evaluateWithBrowserMode(
-          args,
-          buildNavigateExpression(args.url, args.waitForLoad),
-          10000
-        );
+        const state = await navigateWithBrowserMode(args);
         return {
           content: [
             {
               type: 'text',
-              text: `Navigated to ${result.result?.url || args.url}`,
+              text: `Navigated to ${state.url || args.url}`,
             },
           ],
         };
