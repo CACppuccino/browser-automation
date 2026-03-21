@@ -5,6 +5,7 @@ import type { ServiceConfig, ServiceInfo, HealthStatus } from './types.js';
 import { getLogger } from './logger.js';
 import { HttpServer } from './http-server.js';
 import { IsolationRouter } from './isolation-router.js';
+import { BrowserSessionRegistry } from './browser-session-registry.js';
 import { initMetrics } from './metrics.js';
 import { initStats, getStats } from './stats.js';
 import { initTracing, shutdownTracing } from './tracing.js';
@@ -13,7 +14,8 @@ export class ServiceManager {
   private config: ServiceConfig;
   private httpServer: HttpServer | null = null;
   private isolationRouter: IsolationRouter | null = null;
-  private startTime: number = 0;
+  private browserSessionRegistry: BrowserSessionRegistry | null = null;
+  private startTime = 0;
   private shutdownHandlers: Array<() => Promise<void>> = [];
   private isShuttingDown = false;
 
@@ -28,6 +30,7 @@ export class ServiceManager {
       host: this.config.service.host,
       port: this.config.service.port,
       isolation: this.config.isolation.default,
+      defaultBrowserMode: this.config.browser.defaultMode,
     });
 
     this.startTime = Date.now();
@@ -40,11 +43,12 @@ export class ServiceManager {
       logger.info('OpenTelemetry tracing enabled');
     }
 
-    // Initialize isolation router
+    this.browserSessionRegistry = new BrowserSessionRegistry(this.config.browser);
+    this.browserSessionRegistry.startCleanupLoop();
+
     this.isolationRouter = new IsolationRouter(this.config);
 
-    // Start HTTP server
-    this.httpServer = new HttpServer(this.config, this.isolationRouter);
+    this.httpServer = new HttpServer(this.config, this.isolationRouter, this.browserSessionRegistry);
     this.httpServer.registerHealthCheck(() => this.healthCheck());
     await this.httpServer.start();
 
@@ -52,6 +56,7 @@ export class ServiceManager {
       port: this.config.service.port,
       metricsPort: this.config.monitoring.metricsPort,
       tracingEnabled: this.config.monitoring.enableTracing,
+      defaultBrowserMode: this.config.browser.defaultMode,
     });
 
     return {
@@ -61,6 +66,7 @@ export class ServiceManager {
         host: this.config.service.host,
         port: this.config.service.port,
         metricsPort: this.config.monitoring.metricsPort,
+        defaultBrowserMode: this.config.browser.defaultMode,
       },
     };
   }
@@ -78,9 +84,11 @@ export class ServiceManager {
 
     // Execute shutdown handlers with timeout
     const shutdownPromise = Promise.all(
-      this.shutdownHandlers.map(handler => handler().catch(err => {
-        logger.error('Shutdown handler failed', err);
-      }))
+      this.shutdownHandlers.map((handler) =>
+        handler().catch((err) => {
+          logger.error('Shutdown handler failed', err);
+        })
+      )
     );
 
     const timeoutPromise = new Promise<void>((resolve) => {
@@ -92,19 +100,21 @@ export class ServiceManager {
 
     await Promise.race([shutdownPromise, timeoutPromise]);
 
-    // Stop HTTP server
     if (this.httpServer) {
       await this.httpServer.stop();
       this.httpServer = null;
     }
 
-    // Cleanup isolation strategies
+    if (this.browserSessionRegistry) {
+      await this.browserSessionRegistry.cleanupAll();
+      this.browserSessionRegistry = null;
+    }
+
     if (this.isolationRouter) {
       await this.isolationRouter.destroyAll();
       this.isolationRouter = null;
     }
 
-    // Shutdown tracing
     if (this.config.monitoring.enableTracing) {
       await shutdownTracing();
     }
@@ -122,33 +132,34 @@ export class ServiceManager {
       this.config = { ...this.config, ...partialConfig };
     }
 
-    return await this.start();
+    return this.start();
   }
 
   async healthCheck(): Promise<HealthStatus> {
     const errors: string[] = [];
     const stats = getStats();
 
-    // Check HTTP server
     if (!this.httpServer) {
       errors.push('HTTP server not running');
     }
 
-    // Check CDP connections
     const cdpConnections = await this.checkCdpEndpoints();
-
-    // Get service stats
     const serviceStats = stats.getServiceStats();
+    const browserStats = this.browserSessionRegistry?.getStats();
 
-    const status = errors.length > 0 ? 'unhealthy' :
-                   cdpConnections.some(c => c.status === 'disconnected') ? 'degraded' :
-                   'healthy';
+    const status =
+      errors.length > 0
+        ? 'unhealthy'
+        : cdpConnections.some((connection) => connection.status === 'disconnected')
+          ? 'degraded'
+          : 'healthy';
 
     return {
       status,
       uptime: this.startTime > 0 ? Date.now() - this.startTime : 0,
       activeEngines: serviceStats.activeEngines,
-      activeSessions: serviceStats.activeAgents,
+      activeSessions: browserStats?.activeSessions ?? serviceStats.activeAgents,
+      activeBrowserInstances: browserStats?.activeBrowserInstances,
       cdpConnections,
       errors,
       timestamp: new Date().toISOString(),
@@ -156,37 +167,41 @@ export class ServiceManager {
   }
 
   private async checkCdpEndpoints(): Promise<HealthStatus['cdpConnections']> {
-    const results = await Promise.all(
-      this.config.cdp.endpoints.map(async endpoint => {
+    const urls = this.browserSessionRegistry
+      ? this.browserSessionRegistry.getHealthConnections().map((connection) => connection.url)
+      : this.config.cdp.endpoints.map((endpoint) => endpoint.url);
+
+    const uniqueUrls = Array.from(new Set(urls));
+
+    return Promise.all(
+      uniqueUrls.map(async (url) => {
         try {
           const start = Date.now();
-          const response = await fetch(`${endpoint.url}/json/version`, {
+          const response = await fetch(`${url}/json/version`, {
             signal: AbortSignal.timeout(2000),
           });
 
           if (!response.ok) {
             return {
-              url: endpoint.url,
+              url,
               status: 'disconnected' as const,
             };
           }
 
           const latencyMs = Date.now() - start;
           return {
-            url: endpoint.url,
+            url,
             status: 'connected' as const,
             latencyMs,
           };
         } catch {
           return {
-            url: endpoint.url,
+            url,
             status: 'disconnected' as const,
           };
         }
       })
     );
-
-    return results;
   }
 
   registerShutdownHandler(handler: () => Promise<void>): void {

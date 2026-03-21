@@ -30,6 +30,27 @@ cdp:
     maxRetries: 3                 # NEW: Retry failed connections
     retryDelayMs: 100             # NEW: Delay between retries
 
+browser:
+  defaultMode: shared
+  shared:
+    cdpUrl: http://localhost:9222
+  dedicated:
+    enabled: true
+    executablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    host: 127.0.0.1
+    startingPort: 9230
+    maxInstances: 10
+    idleTimeoutMs: 300000
+    startupTimeoutMs: 15000
+    headless: false
+    userDataDirBase: /tmp/browser-automation-sessions
+    extraArgs: []
+  target:
+    createUrl: about:blank
+    enforceOwnership: true
+    allowClientTargetOverride: false
+  cleanupIntervalMs: 30000
+
 timeouts:
   defaultBudgetMs: 30000          # 30 seconds
   maxBudgetMs: 120000             # 2 minutes

@@ -2,22 +2,32 @@
  * CDP Evaluate Engine - Independent CDP evaluation engine
  * Bypasses Playwright's per-page command queue
  */
-import type { EvaluateRequest, EvaluateResponse, Budget, IsolationLevel } from './types.js';
+import type { EngineEvaluateRequest, EvaluateResponse, Budget, IsolationLevel } from './types.js';
 import { getBudgetManager } from './budget-manager.js';
-import { openCdpWebSocket, getCdpWebSocketUrl, createCdpSender, sendWithBudget } from './cdp-helpers.js';
+import {
+  openCdpWebSocket,
+  getBrowserWebSocketUrl,
+  createCdpSender,
+  sendWithBudget,
+} from './cdp-helpers.js';
 import { getLogger } from './logger.js';
 import type { CdpSendFn } from './cdp-helpers.js';
 import { getMetrics } from './metrics.js';
 import { getStats } from './stats.js';
-import { startEvaluateSpan, addIsolationAttributes, addConnectionAttributes, addResultAttributes } from './tracing.js';
+import {
+  startEvaluateSpan,
+  addIsolationAttributes,
+  addConnectionAttributes,
+  addResultAttributes,
+} from './tracing.js';
 
 export class CdpEvaluateEngine {
-  private cdpUrl: string;
+  private fallbackCdpUrl: string;
   private isolationLevel: IsolationLevel;
   private engineId: string;
 
   constructor(cdpUrl: string, isolationLevel: IsolationLevel, engineId: string) {
-    this.cdpUrl = cdpUrl;
+    this.fallbackCdpUrl = cdpUrl;
     this.isolationLevel = isolationLevel;
     this.engineId = engineId;
   }
@@ -25,22 +35,20 @@ export class CdpEvaluateEngine {
   /**
    * Execute JavaScript evaluation
    */
-  async evaluate(request: EvaluateRequest): Promise<EvaluateResponse> {
+  async evaluate(request: EngineEvaluateRequest): Promise<EvaluateResponse> {
     const logger = getLogger();
     const budgetManager = getBudgetManager();
     const metrics = getMetrics();
     const stats = getStats();
     const startMs = Date.now();
+    const cdpUrl = request.cdpUrl || this.fallbackCdpUrl;
 
     // Start tracing span
     const { span, endSpan } = startEvaluateSpan(request);
     addIsolationAttributes(span, this.isolationLevel, this.engineId);
 
     // Start metrics timer
-    const endTimer = metrics.recordEvaluateStart(
-      request.agentId || 'default',
-      this.isolationLevel
-    );
+    const endTimer = metrics.recordEvaluateStart(request.agentId, this.isolationLevel);
 
     // Create budget
     const budget = budgetManager.createBudget(request.budget);
@@ -49,29 +57,27 @@ export class CdpEvaluateEngine {
       logger.debug('Starting evaluation', {
         agentId: request.agentId,
         targetId: request.targetId,
+        browserMode: request.browserMode,
+        browserInstanceId: request.browserInstanceId,
         engineId: this.engineId,
       });
 
-      // Get WebSocket URL
-      const wsUrl = await getCdpWebSocketUrl(this.cdpUrl, budget);
+      // Get browser WebSocket URL
+      const wsUrl = await getBrowserWebSocketUrl(cdpUrl, budget);
       addConnectionAttributes(span, wsUrl);
 
       // Open WebSocket connection
       const ws = await openCdpWebSocket(wsUrl, budget);
       const sender = createCdpSender(ws);
+      let sessionId: string | undefined;
 
       try {
         let result: unknown;
-        let sessionId: string | undefined;
 
-        // If targetId specified, attach to target
-        if (request.targetId) {
-          sessionId = await this.attachToTarget(sender, request.targetId, budget);
-        }
+        sessionId = await this.attachToTarget(sender, request.targetId, budget);
 
         // Execute evaluation
         if (request.backendDOMNodeId !== undefined) {
-          // Element-level evaluation
           result = await this.evaluateOnNode(
             sender,
             sessionId,
@@ -81,7 +87,6 @@ export class CdpEvaluateEngine {
             budget
           );
         } else {
-          // Page-level evaluation
           result = await this.evaluateOnPage(
             sender,
             sessionId,
@@ -92,31 +97,25 @@ export class CdpEvaluateEngine {
           );
         }
 
-        // Detach from target
-        if (sessionId) {
-          await this.detachFromTarget(sender, sessionId, budget).catch(() => {
-            // Best effort
-          });
-        }
+        await this.detachFromTarget(sender, sessionId, budget).catch(() => {
+          // Best effort
+        });
+        sessionId = undefined;
 
-        // Close WebSocket
         ws.close();
 
         const durationMs = Date.now() - startMs;
-        const resultSize = JSON.stringify(result).length;
+        const serializedResult = JSON.stringify(result);
+        const resultSize = serializedResult ? serializedResult.length : 0;
 
         // Record success metrics
         endTimer();
-        metrics.recordEvaluateComplete(
-          request.agentId || 'default',
-          this.isolationLevel,
-          'success'
-        );
+        metrics.recordEvaluateComplete(request.agentId, this.isolationLevel, 'success');
 
         // Record stats
         stats.recordRequest(
           this.engineId,
-          request.agentId || 'default',
+          request.agentId,
           this.isolationLevel,
           durationMs,
           'success'
@@ -128,6 +127,9 @@ export class CdpEvaluateEngine {
 
         logger.debug('Evaluation completed', {
           agentId: request.agentId,
+          browserMode: request.browserMode,
+          browserInstanceId: request.browserInstanceId,
+          targetId: request.targetId,
           durationMs,
           engineId: this.engineId,
         });
@@ -138,12 +140,21 @@ export class CdpEvaluateEngine {
             durationMs,
             isolationLevel: this.isolationLevel,
             engineId: this.engineId,
+            browserMode: request.browserMode,
+            browserInstanceId: request.browserInstanceId,
+            targetId: request.targetId,
           },
         };
       } catch (error) {
-        // On timeout/abort, try to terminate execution
-        if (budget.signal.aborted && request.targetId) {
-          await this.terminateExecution(sender, request.targetId, budget).catch(() => {
+        // On timeout/abort, try to terminate execution in the attached target session.
+        if (budget.signal.aborted && sessionId) {
+          await this.terminateExecution(sender, sessionId).catch(() => {
+            // Best effort
+          });
+        }
+
+        if (sessionId) {
+          await this.detachFromTarget(sender, sessionId, budget).catch(() => {
             // Best effort
           });
         }
@@ -158,7 +169,7 @@ export class CdpEvaluateEngine {
       // Record error metrics
       endTimer();
       metrics.recordEvaluateComplete(
-        request.agentId || 'default',
+        request.agentId,
         this.isolationLevel,
         isTimeout ? 'timeout' : 'error'
       );
@@ -173,7 +184,7 @@ export class CdpEvaluateEngine {
       // Record stats
       stats.recordRequest(
         this.engineId,
-        request.agentId || 'default',
+        request.agentId,
         this.isolationLevel,
         durationMs,
         isTimeout ? 'timeout' : 'error'
@@ -184,6 +195,9 @@ export class CdpEvaluateEngine {
 
       logger.error('Evaluation failed', error, {
         agentId: request.agentId,
+        browserMode: request.browserMode,
+        browserInstanceId: request.browserInstanceId,
+        targetId: request.targetId,
         durationMs,
         engineId: this.engineId,
         isTimeout,
@@ -216,13 +230,7 @@ export class CdpEvaluateEngine {
     sessionId: string,
     budget: Budget
   ): Promise<void> {
-    await sendWithBudget(
-      sender,
-      'Target.detachFromTarget',
-      { sessionId },
-      undefined,
-      budget
-    );
+    await sendWithBudget(sender, 'Target.detachFromTarget', { sessionId }, undefined, budget);
   }
 
   private async evaluateOnPage(
@@ -234,13 +242,7 @@ export class CdpEvaluateEngine {
     budget: Budget
   ): Promise<unknown> {
     // Enable Runtime domain
-    await sendWithBudget(
-      sender,
-      'Runtime.enable',
-      {},
-      sessionId,
-      budget
-    );
+    await sendWithBudget(sender, 'Runtime.enable', {}, sessionId, budget);
 
     // Execute evaluation
     const result = await sendWithBudget<{
@@ -325,30 +327,27 @@ export class CdpEvaluateEngine {
     return callResult.result?.value;
   }
 
-  private async terminateExecution(
-    sender: CdpSendFn,
-    _targetId: string,
-    _budget: Budget
-  ): Promise<void> {
+  private async terminateExecution(sender: CdpSendFn, sessionId: string): Promise<void> {
     const logger = getLogger();
+    const terminateBudget = getBudgetManager().createBudget({ timeoutMs: 1500 });
 
     try {
-      // Short timeout for termination itself
-      const terminateBudget = getBudgetManager().createBudget({
-        timeoutMs: 1500,
-      });
-
       await sendWithBudget(
         sender,
         'Runtime.terminateExecution',
         {},
-        undefined,
+        sessionId,
         terminateBudget
       );
 
-      logger.warn('Execution terminated');
+      logger.warn('Execution terminated', { engineId: this.engineId, sessionId });
     } catch (error) {
-      logger.error('Failed to terminate execution', error);
+      logger.error('Failed to terminate execution', error, {
+        engineId: this.engineId,
+        sessionId,
+      });
+    } finally {
+      terminateBudget.cleanup();
     }
   }
 

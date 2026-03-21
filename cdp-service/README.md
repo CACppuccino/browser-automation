@@ -39,8 +39,11 @@ npm run build
 # 设置认证令牌
 export CDP_SERVICE_TOKEN="your-secret-token"
 
-# 启动Chrome（如果还没有运行）
-chromium --remote-debugging-port=9222 --headless
+# 启动Chrome（如果还没有运行，默认推荐有头模式）
+chromium --remote-debugging-port=9222
+
+# 如需无头模式，可显式开启
+# chromium --remote-debugging-port=9222 --headless
 
 # 启动CDP服务
 npm start config.yaml
@@ -68,6 +71,14 @@ curl http://localhost:3100/health
   ]
 }
 ```
+
+### 浏览器模式说明
+
+- `shared` 模式复用你提供的 CDP Chrome（例如 `http://localhost:9222`）
+- `dedicated` 模式为每个 agent 启动独立 Chrome 实例
+- `browser.dedicated.headless` 控制 dedicated 实例是否无头运行
+- 默认配置现在是 `headless: false`，也就是有头模式，便于观察执行过程并降低部分站点对无头浏览器的风控命中率
+- 如需恢复无头模式，把 `config.yaml` 或 `config-optimized.yaml` 中的 `browser.dedicated.headless` 改为 `true`
 
 ## 核心功能
 
@@ -166,6 +177,27 @@ cdp:
   endpoints:
     - url: http://localhost:9222
 
+browser:
+  defaultMode: shared
+  shared:
+    cdpUrl: http://localhost:9222
+  dedicated:
+    enabled: true
+    executablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    host: 127.0.0.1
+    startingPort: 9230
+    maxInstances: 10
+    idleTimeoutMs: 300000
+    startupTimeoutMs: 15000
+    headless: false
+    userDataDirBase: /tmp/browser-automation-sessions
+    extraArgs: []
+  target:
+    createUrl: about:blank
+    enforceOwnership: true
+    allowClientTargetOverride: false
+  cleanupIntervalMs: 30000
+
 isolation:
   strategy: dynamic
   default: context
@@ -198,6 +230,27 @@ cdp:
     minIdleConnections: 10
     connectTimeoutMs: 10000
     maxRetries: 3
+
+browser:
+  defaultMode: shared
+  shared:
+    cdpUrl: http://localhost:9222
+  dedicated:
+    enabled: true
+    executablePath: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+    host: 127.0.0.1
+    startingPort: 9230
+    maxInstances: 10
+    idleTimeoutMs: 300000
+    startupTimeoutMs: 15000
+    headless: false
+    userDataDirBase: /tmp/browser-automation-sessions
+    extraArgs: []
+  target:
+    createUrl: about:blank
+    enforceOwnership: true
+    allowClientTargetOverride: false
+  cleanupIntervalMs: 30000
 
 isolation:
   strategy: dynamic

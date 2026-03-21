@@ -4,6 +4,8 @@
  * To be used by openclaw gateway for browser operations
  */
 
+export type CdpBrowserMode = 'shared' | 'dedicated';
+
 export interface CdpServiceConfig {
   serviceUrl: string;
   authToken: string;
@@ -16,6 +18,7 @@ export interface CdpEvaluateRequest {
   sessionId?: string;
   agentId?: string;
   targetId?: string;
+  browserMode?: CdpBrowserMode;
   expression: string;
   awaitPromise?: boolean;
   returnByValue?: boolean;
@@ -39,8 +42,27 @@ export interface CdpEvaluateResponse {
     durationMs: number;
     isolationLevel: 'process' | 'context' | 'session';
     engineId: string;
+    browserMode?: CdpBrowserMode;
+    browserInstanceId?: string;
+    targetId?: string;
     terminatedViaSignal?: boolean;
   };
+}
+
+export interface CdpSessionRequest {
+  agentId: string;
+  browserMode?: CdpBrowserMode;
+  targetId?: string;
+}
+
+export interface CdpSessionResponse {
+  agentId: string;
+  browserMode: CdpBrowserMode;
+  browserInstanceId: string;
+  cdpUrl: string;
+  targetId: string;
+  createdAt: number;
+  lastUsedAt: number;
 }
 
 export interface CdpServiceHealth {
@@ -48,6 +70,7 @@ export interface CdpServiceHealth {
   uptime: number;
   activeEngines: number;
   activeSessions: number;
+  activeBrowserInstances?: number;
   cdpConnections: Array<{
     url: string;
     status: 'connected' | 'disconnected';
@@ -67,6 +90,17 @@ export interface CdpServiceStats {
   activeAgents: number;
   avgDurationMs: number;
   requestsPerSecond: number;
+  browser?: {
+    activeSessions: number;
+    activeBrowserInstances: number;
+    sessions: Array<{
+      agentId: string;
+      browserMode: CdpBrowserMode;
+      browserInstanceId: string;
+      targetId: string;
+      lastUsedAt: number;
+    }>;
+  };
 }
 
 /**
@@ -82,6 +116,7 @@ export interface CdpServiceStats {
  *
  * const result = await client.evaluate({
  *   agentId: 'my-agent',
+ *   browserMode: 'shared',
  *   expression: 'document.title',
  *   budget: { timeoutMs: 5000 }
  * });
@@ -109,35 +144,48 @@ export class CdpServiceClient {
    * Execute JavaScript evaluation
    */
   async evaluate(request: CdpEvaluateRequest): Promise<CdpEvaluateResponse> {
-    // Apply default timeout if not specified
     if (!request.budget) {
       request.budget = { timeoutMs: this.config.defaultTimeout };
     } else if (!request.budget.timeoutMs) {
       request.budget.timeoutMs = this.config.defaultTimeout;
     }
 
-    const response = await this.request<CdpEvaluateResponse>(
+    return this.request<CdpEvaluateResponse>(
       'POST',
       '/api/v1/evaluate',
       request,
-      request.budget.timeoutMs + 1000 // Add 1s buffer
+      request.budget.timeoutMs + 1000
     );
+  }
 
-    return response;
+  /**
+   * Create or resolve a browser session for an agent.
+   */
+  async createSession(request: CdpSessionRequest): Promise<CdpSessionResponse> {
+    return this.request<CdpSessionResponse>('POST', '/api/v1/sessions', request, 10000);
+  }
+
+  /**
+   * Get an existing browser session.
+   */
+  async getSession(agentId: string, browserMode?: CdpBrowserMode): Promise<CdpSessionResponse> {
+    const query = browserMode ? `?browserMode=${encodeURIComponent(browserMode)}` : '';
+    return this.request<CdpSessionResponse>('GET', `/api/v1/sessions/${encodeURIComponent(agentId)}${query}`);
+  }
+
+  /**
+   * Delete a browser session.
+   */
+  async deleteSession(agentId: string, browserMode?: CdpBrowserMode): Promise<void> {
+    const query = browserMode ? `?browserMode=${encodeURIComponent(browserMode)}` : '';
+    await this.request<void>('DELETE', `/api/v1/sessions/${encodeURIComponent(agentId)}${query}`);
   }
 
   /**
    * Get service health status
    */
   async getHealth(): Promise<CdpServiceHealth> {
-    const response = await this.request<CdpServiceHealth>(
-      'GET',
-      '/health',
-      undefined,
-      5000,
-      false // No auth required for health
-    );
-
+    const response = await this.request<CdpServiceHealth>('GET', '/health', undefined, 5000, false);
     this.healthStatus = response;
     return response;
   }
@@ -146,12 +194,7 @@ export class CdpServiceClient {
    * Get service statistics
    */
   async getStats(): Promise<CdpServiceStats> {
-    return this.request<CdpServiceStats>(
-      'GET',
-      '/api/v1/stats',
-      undefined,
-      5000
-    );
+    return this.request<CdpServiceStats>('GET', '/api/v1/stats', undefined, 5000);
   }
 
   /**
@@ -211,16 +254,20 @@ export class CdpServiceClient {
       clearTimeout(timeout);
 
       if (!response.ok) {
-        const error: any = await response.json().catch(() => ({
+        const errorPayload = (await response.json().catch(() => ({
           error: 'Unknown error',
           message: response.statusText,
-        }));
+        }))) as { error?: string; message?: string };
 
         throw new CdpServiceError(
-          (error.message || error.error || 'Request failed') as string,
+          errorPayload.message || errorPayload.error || 'Request failed',
           response.status,
-          error
+          errorPayload
         );
+      }
+
+      if (response.status === 204) {
+        return undefined as T;
       }
 
       return (await response.json()) as T;
@@ -232,18 +279,14 @@ export class CdpServiceClient {
       }
 
       if ((error as Error).name === 'AbortError') {
-        throw new CdpServiceError(
-          `Request timeout after ${timeoutMs}ms`,
-          408,
-          { timeout: timeoutMs }
-        );
+        throw new CdpServiceError(`Request timeout after ${timeoutMs}ms`, 408, {
+          timeout: timeoutMs,
+        });
       }
 
-      throw new CdpServiceError(
-        error instanceof Error ? error.message : 'Unknown error',
-        0,
-        { originalError: error }
-      );
+      throw new CdpServiceError(error instanceof Error ? error.message : 'Unknown error', 0, {
+        originalError: error,
+      });
     }
   }
 
@@ -251,12 +294,10 @@ export class CdpServiceClient {
    * Start periodic health checks
    */
   private startHealthCheck(): void {
-    // Immediate health check
     this.getHealth().catch(() => {
       // Ignore initial errors
     });
 
-    // Periodic health checks
     this.healthCheckTimer = setInterval(() => {
       this.getHealth().catch(() => {
         // Ignore errors during periodic checks
@@ -282,8 +323,6 @@ export class CdpServiceError extends Error {
 /**
  * Create CDP Service client with configuration
  */
-export function createCdpServiceClient(
-  config: CdpServiceConfig
-): CdpServiceClient {
+export function createCdpServiceClient(config: CdpServiceConfig): CdpServiceClient {
   return new CdpServiceClient(config);
 }

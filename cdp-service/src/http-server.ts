@@ -3,9 +3,18 @@
  */
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { createServer, type Server } from 'node:http';
-import type { ServiceConfig, HealthStatus, EvaluateRequest, EvaluateResponse } from './types.js';
+import type {
+  ServiceConfig,
+  HealthStatus,
+  EvaluateRequest,
+  EvaluateResponse,
+  BrowserMode,
+  BrowserSessionRequest,
+  EngineEvaluateRequest,
+} from './types.js';
 import { getLogger } from './logger.js';
 import { IsolationRouter } from './isolation-router.js';
+import { BrowserSessionRegistry } from './browser-session-registry.js';
 import { getQueueManager } from './queue-manager.js';
 import { getBudgetManager } from './budget-manager.js';
 import { getMetrics } from './metrics.js';
@@ -16,11 +25,17 @@ export class HttpServer {
   private server: Server | null = null;
   private config: ServiceConfig;
   private isolationRouter: IsolationRouter;
+  private browserSessionRegistry: BrowserSessionRegistry;
   private healthCheckFn: (() => Promise<HealthStatus>) | null = null;
 
-  constructor(config: ServiceConfig, isolationRouter: IsolationRouter) {
+  constructor(
+    config: ServiceConfig,
+    isolationRouter: IsolationRouter,
+    browserSessionRegistry: BrowserSessionRegistry
+  ) {
     this.config = config;
     this.isolationRouter = isolationRouter;
+    this.browserSessionRegistry = browserSessionRegistry;
     this.app = express();
     this.setupMiddleware();
     this.setupRoutes();
@@ -76,8 +91,8 @@ export class HttpServer {
         }
 
         const health = await this.healthCheckFn();
-        const statusCode = health.status === 'healthy' ? 200 :
-                          health.status === 'degraded' ? 200 : 503;
+        const statusCode =
+          health.status === 'healthy' ? 200 : health.status === 'degraded' ? 200 : 503;
 
         res.status(statusCode).json(health);
       } catch (error) {
@@ -107,8 +122,9 @@ export class HttpServer {
       res.json({
         name: 'cdp-service',
         version: '1.0.0',
-        capabilities: ['evaluate', 'snapshot', 'screenshot'],
+        capabilities: ['evaluate', 'snapshot', 'screenshot', 'sessions'],
         isolationLevels: ['process', 'context', 'session'],
+        browserModes: ['shared', 'dedicated'],
       });
     });
 
@@ -117,7 +133,10 @@ export class HttpServer {
       try {
         const stats = getStats();
         const data = stats.getServiceStats();
-        res.json(data);
+        res.json({
+          ...data,
+          browser: this.browserSessionRegistry.getStats(),
+        });
       } catch (error) {
         logger.error('Failed to get stats', error);
         res.status(500).json({ error: 'Failed to get statistics' });
@@ -153,35 +172,137 @@ export class HttpServer {
       }
     });
 
-    // Sessions API (placeholder for Phase 2)
-    this.app.post('/api/v1/sessions', (_req, res) => {
-      res.status(501).json({
-        error: 'Not Implemented',
-        message: 'Session management will be implemented in Phase 2',
+    this.app.post('/api/v1/sessions', async (req, res) => {
+      const request = req.body as BrowserSessionRequest;
+      const agentId = request.agentId?.trim();
+
+      if (!agentId) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'agentId is required',
+        });
+        return;
+      }
+
+      const browserMode = this.normalizeBrowserMode(request.browserMode) || this.config.browser.defaultMode;
+      if (request.browserMode && !this.normalizeBrowserMode(request.browserMode)) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'browserMode must be shared or dedicated',
+        });
+        return;
+      }
+
+      const budget = getBudgetManager().createBudget({
+        timeoutMs: this.config.timeouts.defaultBudgetMs,
       });
+
+      try {
+        const session = await this.browserSessionRegistry.resolveSession(
+          {
+            agentId,
+            browserMode,
+            targetId: request.targetId,
+          },
+          budget
+        );
+        res.status(201).json(this.browserSessionRegistry.toResponse(session));
+      } catch (error) {
+        logger.error('Failed to create browser session', error, { agentId, browserMode });
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        res.status(400).json({
+          error: 'Session Creation Failed',
+          message,
+        });
+      } finally {
+        budget.cleanup();
+      }
     });
 
-    this.app.delete('/api/v1/sessions/:id', (_req, res) => {
-      res.status(501).json({
-        error: 'Not Implemented',
-        message: 'Session management will be implemented in Phase 2',
-      });
+    this.app.get('/api/v1/sessions/:id', async (req, res) => {
+      const agentId = req.params.id;
+      const browserMode = this.normalizeBrowserMode(req.query.browserMode);
+
+      if (req.query.browserMode !== undefined && !browserMode) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'browserMode must be shared or dedicated',
+        });
+        return;
+      }
+
+      const session = await this.browserSessionRegistry.getSession(agentId, browserMode || undefined);
+      if (!session) {
+        res.status(404).json({
+          error: 'Not Found',
+          message: `No browser session found for agent ${agentId}`,
+        });
+        return;
+      }
+
+      res.json(this.browserSessionRegistry.toResponse(session));
+    });
+
+    this.app.delete('/api/v1/sessions/:id', async (req, res) => {
+      const agentId = req.params.id;
+      const browserMode = this.normalizeBrowserMode(req.query.browserMode);
+
+      if (req.query.browserMode !== undefined && !browserMode) {
+        res.status(400).json({
+          error: 'Bad Request',
+          message: 'browserMode must be shared or dedicated',
+        });
+        return;
+      }
+
+      try {
+        const released = await this.browserSessionRegistry.releaseSession(
+          agentId,
+          browserMode || undefined
+        );
+
+        if (!released) {
+          res.status(404).json({
+            error: 'Not Found',
+            message: `No browser session found for agent ${agentId}`,
+          });
+          return;
+        }
+
+        res.status(204).send();
+      } catch (error) {
+        logger.error('Failed to release browser session', error, { agentId, browserMode });
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        res.status(500).json({
+          error: 'Session Release Failed',
+          message,
+        });
+      }
     });
 
     // Evaluate API
     this.app.post('/api/v1/evaluate', async (req, res) => {
-      const logger = getLogger();
       const budgetManager = getBudgetManager();
       const queueManager = getQueueManager();
 
       try {
-        // Validate request
         const request = req.body as EvaluateRequest;
 
         if (!request.expression) {
           res.status(400).json({
             error: 'Bad Request',
             message: 'expression is required',
+          });
+          return;
+        }
+
+        const agentId = request.agentId?.trim() || 'default';
+        const browserMode = this.normalizeBrowserMode(request.browserMode) || this.config.browser.defaultMode;
+
+        if (request.browserMode && !this.normalizeBrowserMode(request.browserMode)) {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: 'browserMode must be shared or dedicated',
           });
           return;
         }
@@ -197,48 +318,72 @@ export class HttpServer {
           return;
         }
 
-        request.budget = {
+        const budgetRequest = {
           timeoutMs,
         };
+        const requestBudget = budgetManager.createBudget(budgetRequest);
 
-        // Select isolation level
-        const level = this.isolationRouter.selectLevel({
-          agentId: request.agentId,
-          requestType: 'evaluate',
-        });
-
-        logger.info('Evaluate request', {
-          agentId: request.agentId,
-          targetId: request.targetId,
-          isolationLevel: level,
-          timeoutMs,
-        });
-
-        // Get engine for this isolation level
-        const strategy = this.isolationRouter.getStrategy(level);
-        const engine = await strategy.getEngine(request.agentId || 'default');
-
-        // Execute with queue management (if targetId specified)
-        let result: EvaluateResponse;
-
-        if (request.targetId) {
-          const budget = budgetManager.createBudget(request.budget);
-          result = await queueManager.enqueue(
-            request.targetId,
-            () => engine.evaluate(request),
-            budget
+        try {
+          const session = await this.browserSessionRegistry.resolveSession(
+            {
+              agentId,
+              browserMode,
+              targetId: request.targetId,
+            },
+            requestBudget
           );
-        } else {
-          result = await engine.evaluate(request);
-        }
 
-        res.json(result);
+          const level = this.isolationRouter.selectLevel({
+            agentId,
+            requestType: 'evaluate',
+          });
+
+          logger.info('Evaluate request', {
+            agentId,
+            targetId: session.targetId,
+            browserMode,
+            browserInstanceId: session.browserInstanceId,
+            isolationLevel: level,
+            timeoutMs,
+          });
+
+          const strategy = this.isolationRouter.getStrategy(level);
+          const engine = await strategy.getEngine(agentId);
+
+          const engineRequest: EngineEvaluateRequest = {
+            ...request,
+            agentId,
+            browserMode,
+            browserInstanceId: session.browserInstanceId,
+            cdpUrl: session.cdpUrl,
+            targetId: session.targetId,
+            budget: budgetRequest,
+          };
+
+          const queueBudget = budgetManager.propagateBudget(requestBudget, 50);
+          let result: EvaluateResponse;
+
+          try {
+            result = await queueManager.enqueue(
+              session.targetId,
+              () => engine.evaluate(engineRequest),
+              queueBudget
+            );
+          } finally {
+            queueBudget.cleanup();
+          }
+
+          res.json(result);
+        } finally {
+          requestBudget.cleanup();
+        }
       } catch (error) {
         logger.error('Evaluate failed', error);
 
         const message = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = this.isClientError(message) ? 400 : 500;
 
-        res.status(500).json({
+        res.status(statusCode).json({
           error: 'Evaluation Failed',
           message,
         });
@@ -281,17 +426,13 @@ export class HttpServer {
           }
         });
 
-        this.server.listen(
-          this.config.service.port,
-          this.config.service.host,
-          () => {
-            logger.info('HTTP server started', {
-              host: this.config.service.host,
-              port: this.config.service.port,
-            });
-            resolve();
-          }
-        );
+        this.server.listen(this.config.service.port, this.config.service.host, () => {
+          logger.info('HTTP server started', {
+            host: this.config.service.host,
+            port: this.config.service.port,
+          });
+          resolve();
+        });
       } catch (error) {
         reject(error);
       }
@@ -321,5 +462,23 @@ export class HttpServer {
 
   getApp(): Express {
     return this.app;
+  }
+
+  private normalizeBrowserMode(value: unknown): BrowserMode | null {
+    if (value === 'shared' || value === 'dedicated') {
+      return value;
+    }
+    return null;
+  }
+
+  private isClientError(message: string): boolean {
+    return [
+      'targetId',
+      'browserMode',
+      'Dedicated browser mode is not enabled',
+      'Dedicated browser instance limit reached',
+      'not owned by agent',
+      'not found',
+    ].some((fragment) => message.includes(fragment));
   }
 }

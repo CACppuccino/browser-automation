@@ -3,6 +3,7 @@
  */
 
 export type IsolationLevel = 'process' | 'context' | 'session';
+export type BrowserMode = 'shared' | 'dedicated';
 
 export interface ServiceConfig {
   service: {
@@ -28,6 +29,30 @@ export interface ServiceConfig {
       idleTimeoutMs: number;
     };
   };
+  browser: {
+    defaultMode: BrowserMode;
+    shared: {
+      cdpUrl: string;
+    };
+    dedicated: {
+      enabled: boolean;
+      executablePath?: string;
+      host: string;
+      startingPort: number;
+      maxInstances: number;
+      idleTimeoutMs: number;
+      startupTimeoutMs: number;
+      headless: boolean;
+      userDataDirBase: string;
+      extraArgs?: string[];
+    };
+    target: {
+      createUrl: string;
+      enforceOwnership: boolean;
+      allowClientTargetOverride: boolean;
+    };
+    cleanupIntervalMs: number;
+  };
   timeouts: {
     defaultBudgetMs: number;
     maxBudgetMs: number;
@@ -47,6 +72,7 @@ export interface HealthStatus {
   uptime: number;
   activeEngines: number;
   activeSessions: number;
+  activeBrowserInstances?: number;
   cdpConnections: Array<{
     url: string;
     status: 'connected' | 'disconnected';
@@ -63,6 +89,7 @@ export interface ServiceInfo {
     host: string;
     port: number;
     metricsPort: number;
+    defaultBrowserMode?: BrowserMode;
   };
 }
 
@@ -84,12 +111,21 @@ export interface EvaluateRequest {
   sessionId?: string;
   agentId?: string;
   targetId?: string;
+  browserMode?: BrowserMode;
   expression: string;
   awaitPromise?: boolean;
   returnByValue?: boolean;
   ref?: string;
   backendDOMNodeId?: number;
   budget: BudgetRequest;
+}
+
+export interface EngineEvaluateRequest extends EvaluateRequest {
+  agentId: string;
+  browserMode: BrowserMode;
+  browserInstanceId: string;
+  cdpUrl: string;
+  targetId: string;
 }
 
 export interface EvaluateResponse {
@@ -104,6 +140,9 @@ export interface EvaluateResponse {
     durationMs: number;
     isolationLevel: IsolationLevel;
     engineId: string;
+    browserMode?: BrowserMode;
+    browserInstanceId?: string;
+    targetId?: string;
     terminatedViaSignal?: boolean;
   };
 }
@@ -112,4 +151,44 @@ export interface LoadMetrics {
   activeSessions: number;
   cpuUsage: number;
   memoryUsage: number;
+}
+
+export interface BrowserInstanceRecord {
+  instanceId: string;
+  mode: BrowserMode;
+  cdpUrl: string;
+  ownerAgentId?: string;
+  port?: number;
+  pid?: number;
+  userDataDir?: string;
+  createdAt: number;
+  lastUsedAt: number;
+  status: 'starting' | 'ready' | 'stopping' | 'error';
+}
+
+export interface BrowserSessionRecord {
+  sessionKey: string;
+  agentId: string;
+  browserMode: BrowserMode;
+  browserInstanceId: string;
+  cdpUrl: string;
+  targetId: string;
+  createdAt: number;
+  lastUsedAt: number;
+}
+
+export interface BrowserSessionRequest {
+  agentId: string;
+  browserMode?: BrowserMode;
+  targetId?: string;
+}
+
+export interface BrowserSessionResponse {
+  agentId: string;
+  browserMode: BrowserMode;
+  browserInstanceId: string;
+  cdpUrl: string;
+  targetId: string;
+  createdAt: number;
+  lastUsedAt: number;
 }

@@ -13,6 +13,14 @@ export type CdpSendFn = (
   sessionId?: string
 ) => Promise<unknown>;
 
+export interface CdpTargetInfo {
+  id: string;
+  type: string;
+  title?: string;
+  url?: string;
+  webSocketDebuggerUrl?: string;
+}
+
 type CdpResponse = {
   id: number;
   result?: unknown;
@@ -177,72 +185,148 @@ export async function openCdpWebSocket(
   });
 }
 
+async function fetchJson<T>(
+  url: string,
+  budget: Budget,
+  init?: RequestInit
+): Promise<T> {
+  const logger = getLogger();
+  const controller = new AbortController();
+  const abortHandler = () => controller.abort();
+  budget.signal.addEventListener('abort', abortHandler, { once: true });
+
+  try {
+    logger.debug('Fetching CDP HTTP endpoint', {
+      url,
+      method: init?.method || 'GET',
+      remainingMs: budget.remainingMs(),
+    });
+
+    const response = await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    return (await response.json()) as T;
+  } finally {
+    budget.signal.removeEventListener('abort', abortHandler);
+  }
+}
+
+function assertHttpCdpUrl(cdpUrl: string): void {
+  if (cdpUrl.startsWith('ws://') || cdpUrl.startsWith('wss://')) {
+    throw new Error(`HTTP CDP endpoint required, got WebSocket URL: ${cdpUrl}`);
+  }
+}
+
 /**
- * Get WebSocket URL from CDP endpoint
- * Gets first available page or creates one if none exist
+ * Get the browser-level WebSocket URL from a CDP HTTP endpoint.
+ */
+export async function getBrowserWebSocketUrl(
+  cdpUrl: string,
+  budget: Budget
+): Promise<string> {
+  if (cdpUrl.startsWith('ws://') || cdpUrl.startsWith('wss://')) {
+    return cdpUrl;
+  }
+
+  const version = await fetchJson<{ webSocketDebuggerUrl?: string }>(
+    `${cdpUrl}/json/version`,
+    budget
+  );
+
+  if (!version.webSocketDebuggerUrl) {
+    throw new Error(`No browser webSocketDebuggerUrl found for ${cdpUrl}`);
+  }
+
+  return version.webSocketDebuggerUrl;
+}
+
+/**
+ * List all page targets for a CDP HTTP endpoint.
+ */
+export async function listPageTargets(
+  cdpUrl: string,
+  budget: Budget
+): Promise<CdpTargetInfo[]> {
+  assertHttpCdpUrl(cdpUrl);
+
+  const targets = await fetchJson<CdpTargetInfo[]>(`${cdpUrl}/json/list`, budget);
+  return targets.filter((target) => target.type === 'page');
+}
+
+/**
+ * Check whether a specific page target exists.
+ */
+export async function targetExists(
+  cdpUrl: string,
+  targetId: string,
+  budget: Budget
+): Promise<boolean> {
+  const targets = await listPageTargets(cdpUrl, budget);
+  return targets.some((target) => target.id === targetId);
+}
+
+/**
+ * Resolve the target-level WebSocket URL for a specific page target.
+ */
+export async function getTargetWebSocketUrl(
+  cdpUrl: string,
+  targetId: string,
+  budget: Budget
+): Promise<string> {
+  const targets = await listPageTargets(cdpUrl, budget);
+  const target = targets.find((candidate) => candidate.id === targetId);
+
+  if (!target) {
+    throw new Error(`Target ${targetId} not found at ${cdpUrl}`);
+  }
+
+  if (!target.webSocketDebuggerUrl) {
+    throw new Error(`Target ${targetId} has no webSocketDebuggerUrl`);
+  }
+
+  return target.webSocketDebuggerUrl;
+}
+
+/**
+ * Create a new page target.
+ */
+export async function createPageTarget(
+  cdpUrl: string,
+  url: string,
+  budget: Budget
+): Promise<CdpTargetInfo> {
+  assertHttpCdpUrl(cdpUrl);
+  return fetchJson<CdpTargetInfo>(
+    `${cdpUrl}/json/new?${encodeURIComponent(url)}`,
+    budget,
+    { method: 'PUT' }
+  );
+}
+
+/**
+ * Delete a page target.
+ */
+export async function deleteTarget(
+  cdpUrl: string,
+  targetId: string,
+  budget: Budget
+): Promise<void> {
+  assertHttpCdpUrl(cdpUrl);
+  await fetchJson<unknown>(`${cdpUrl}/json/close/${targetId}`, budget);
+}
+
+/**
+ * Backward-compatible alias for callers that only need a browser WebSocket URL.
  */
 export async function getCdpWebSocketUrl(
   cdpUrl: string,
   budget: Budget
 ): Promise<string> {
-  const logger = getLogger();
-
-  // If already a WebSocket URL, return as-is
-  if (cdpUrl.startsWith('ws://') || cdpUrl.startsWith('wss://')) {
-    return cdpUrl;
-  }
-
-  try {
-    const controller = new AbortController();
-    budget.signal.addEventListener('abort', () => controller.abort(), { once: true });
-
-    // Get list of targets/pages
-    const listUrl = `${cdpUrl}/json/list`;
-    logger.debug('Fetching CDP targets', { listUrl });
-
-    const listResponse = await fetch(listUrl, {
-      signal: controller.signal,
-    });
-
-    if (!listResponse.ok) {
-      throw new Error(`HTTP ${listResponse.status}: ${listResponse.statusText}`);
-    }
-
-    const targets = await listResponse.json() as Array<{
-      type: string;
-      webSocketDebuggerUrl?: string;
-      url?: string;
-    }>;
-
-    // Find first page target
-    const pageTarget = targets.find(t => t.type === 'page');
-
-    if (pageTarget?.webSocketDebuggerUrl) {
-      logger.debug('Using existing page', { url: pageTarget.url });
-      return pageTarget.webSocketDebuggerUrl;
-    }
-
-    // No page found, create new one
-    logger.debug('Creating new page');
-    const newPageUrl = `${cdpUrl}/json/new`;
-    const newResponse = await fetch(newPageUrl, {
-      method: 'PUT',
-      signal: controller.signal,
-    });
-
-    if (!newResponse.ok) {
-      throw new Error(`Failed to create page: HTTP ${newResponse.status}`);
-    }
-
-    const newPage = await newResponse.json() as { webSocketDebuggerUrl?: string };
-
-    if (!newPage.webSocketDebuggerUrl) {
-      throw new Error('No webSocketDebuggerUrl in new page response');
-    }
-
-    return newPage.webSocketDebuggerUrl;
-  } catch (error) {
-    logger.error('Failed to get CDP WebSocket URL', error);
-    throw error;
-  }
+  return getBrowserWebSocketUrl(cdpUrl, budget);
 }
