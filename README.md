@@ -971,4 +971,4 @@ MIT License
 
 **版本**: 1.0.0
 **更新日期**: 2026-03-17
-**维护者**: OpenClaw Team
+**维护者**: Mike & Claude & GPT5.4-xhgih
