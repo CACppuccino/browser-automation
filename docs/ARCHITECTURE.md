@@ -97,23 +97,30 @@ OpenClaw Browser Automation是一个分层的浏览器自动化系统，专为AI
 **职责**：
 - 提供HTTP/WebSocket API
 - 管理CDP引擎池
-- 实现三级隔离策略
+- 管理 shared / dedicated 浏览器所有权
+- 管理 persistent profile / fresh instance 状态模型
+- 支持 workspace / global profile 存储与迁移
 - 监控和统计
 
 **关键特性**：
 - **独立进程架构** - 与Gateway解耦，避免影响主服务
 - **动态隔离路由** - 根据负载和agent特征选择隔离级别
-- **强制超时控制** - 使用Runtime.terminateExecution
+- **ProfileManager** - 统一处理 profile 元数据、路径解析、lock 与 migration
+- **Dedicated Chrome Profiles** - dedicated 模式可直接挂载完整 `user-data-dir`，保留 cookies / localStorage / cache / IndexedDB / service worker / Chrome profile 状态
+- **Fresh Instance Cleanup** - fresh 模式使用临时 user-data-dir，并在会话释放后清理
 - **完整可观测性** - Prometheus + OpenTelemetry + 结构化日志
 
 **实现文件**：
 - `cdp-service/src/index.ts` - 服务入口
 - `cdp-service/src/service-manager.ts` - 生命周期管理
 - `cdp-service/src/http-server.ts` - HTTP/WS服务器
+- `cdp-service/src/browser-session-registry.ts` - 浏览器实例 / session / instanceKey 管理
+- `cdp-service/src/profile-manager.ts` - profile 读写、锁、迁移与路径管理
+- `cdp-service/src/chrome-launcher.ts` - dedicated Chrome 启动与 user-data-dir 挂载
 - `cdp-service/src/cdp-engine.ts` - CDP引擎核心
 - `cdp-service/src/isolation-router.ts` - 隔离策略路由
 
-### 3. 隔离策略
+### 3. 隔离策略与浏览器状态模型
 
 #### Process级隔离
 
@@ -158,11 +165,74 @@ await page.evaluate(expression);
 **劣势**：
 - 共享Chrome进程资源
 - 无法限制单个Context资源
+- 不适合需要完整 Chrome profile 持久化的登录态场景
 
 **适用场景**：
 - 多用户会话
 - 需要独立身份
 - 一般自动化任务
+
+#### Browser State Model（profile / fresh）
+
+在 `shared | dedicated` 浏览器所有权之外，系统额外引入 `stateMode`：
+
+- `profile`：使用持久化 profile 目录，适合登录态、社交网站、风控敏感场景
+- `fresh`：使用一次性临时目录，适合隔离测试与无状态访问
+
+同时支持 `profileScope`：
+- `workspace`：默认模式，profile 写入 agent workspace
+- `global`：全局共享 profile，适合跨 workspace 长期复用
+
+目录布局：
+
+```text
+workspace profile:
+  <workspacePath>/.browser-automation/profiles/<profileId>/
+    user-data/
+    profile.json
+    lock
+
+global profile:
+  <globalRootDir>/<profileId>/
+    user-data/
+    profile.json
+    lock
+
+fresh instance:
+  <browser.dedicated.userDataDirBase>/fresh/<agentId>/<freshInstanceId>/user-data/
+```
+
+关键规则：
+- `shared + fresh` 不允许
+- `shared + profileId` 不允许选择具体 profile
+- `dedicated + profile` 通过完整 `--user-data-dir` 重载 Chrome 状态
+- `dedicated + fresh` 会在释放后删除临时目录
+- workspace profile 默认存储在 agent workspace 下，也可迁移到 global scope
+- 同一 workflow 若要保持浏览器身份，除了 `agentId` 外，还需要稳定复用 `stateMode`、`profileId`、`profileScope` 与 `workspacePath`
+
+#### Profile Locking 与 Migration
+
+为避免同一 profile 被两个 Chrome 进程同时写入，`ProfileManager` 使用 lock 文件记录：
+
+```json
+{
+  "instanceKey": "dedicated:profile:workspace:linkedin-main:/workspace-a",
+  "agentId": "agent-1",
+  "pid": 12345,
+  "timestamp": 1710000000000
+}
+```
+
+迁移通过复制或移动整个 profile 根目录实现，而不是只导出 cookies：
+
+1. 校验源 profile 未被占用，或显式 `force`
+2. 锁定源 / 目标 profile
+3. 拷贝整个 profile 根目录
+4. 更新目标 `profile.json` 中的 `migratedFrom`
+5. 若为 `move`，删除源目录
+6. 释放锁
+
+这种方式可以保留 cookies、localStorage、cache、IndexedDB、Service Worker 与其他 Chromium profile 数据。
 
 #### Session级隔离
 

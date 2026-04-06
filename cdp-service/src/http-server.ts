@@ -11,6 +11,10 @@ import type {
   BrowserMode,
   BrowserSessionRequest,
   EngineEvaluateRequest,
+  BrowserStateMode,
+  ProfileStorageScope,
+  ProfileCreateRequest,
+  ProfileMigrationRequest,
 } from './types.js';
 import { getLogger } from './logger.js';
 import { IsolationRouter } from './isolation-router.js';
@@ -19,6 +23,7 @@ import { getQueueManager } from './queue-manager.js';
 import { getBudgetManager } from './budget-manager.js';
 import { getMetrics } from './metrics.js';
 import { getStats } from './stats.js';
+import { ProfileManager } from './profile-manager.js';
 
 export class HttpServer {
   private app: Express;
@@ -26,6 +31,7 @@ export class HttpServer {
   private config: ServiceConfig;
   private isolationRouter: IsolationRouter;
   private browserSessionRegistry: BrowserSessionRegistry;
+  private profileManager: ProfileManager;
   private healthCheckFn: (() => Promise<HealthStatus>) | null = null;
 
   constructor(
@@ -36,6 +42,7 @@ export class HttpServer {
     this.config = config;
     this.isolationRouter = isolationRouter;
     this.browserSessionRegistry = browserSessionRegistry;
+    this.profileManager = new ProfileManager(config.browser);
     this.app = express();
     this.setupMiddleware();
     this.setupRoutes();
@@ -122,9 +129,10 @@ export class HttpServer {
       res.json({
         name: 'cdp-service',
         version: '1.0.0',
-        capabilities: ['evaluate', 'snapshot', 'screenshot', 'sessions'],
+        capabilities: ['evaluate', 'snapshot', 'screenshot', 'sessions', 'profiles'],
         isolationLevels: ['process', 'context', 'session'],
         browserModes: ['shared', 'dedicated'],
+        stateModes: ['profile', 'fresh'],
       });
     });
 
@@ -172,6 +180,77 @@ export class HttpServer {
       }
     });
 
+    this.app.post('/api/v1/profiles', (req, res) => {
+      try {
+        const request = req.body as ProfileCreateRequest;
+        const response = this.browserSessionRegistry.createProfile(request);
+        res.status(201).json(response);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        res.status(400).json({ error: 'Profile Creation Failed', message });
+      }
+    });
+
+    this.app.get('/api/v1/profiles', (req, res) => {
+      try {
+        const scope = this.normalizeProfileScope(req.query.scope);
+        const workspacePath = this.normalizeOptionalString(req.query.workspacePath);
+        if (req.query.scope !== undefined && !scope) {
+          res.status(400).json({ error: 'Bad Request', message: 'scope must be workspace or global' });
+          return;
+        }
+        const response = this.browserSessionRegistry.listProfiles(scope || undefined, workspacePath);
+        res.json(response);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        res.status(400).json({ error: 'Profile List Failed', message });
+      }
+    });
+
+    this.app.get('/api/v1/profiles/:id', (req, res) => {
+      try {
+        const scope = this.normalizeProfileScope(req.query.scope) || this.config.browser.profiles.defaultScope;
+        const workspacePath = this.normalizeOptionalString(req.query.workspacePath);
+        const response = this.browserSessionRegistry.getProfile(req.params.id, scope, workspacePath);
+        res.json(response);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = message.includes('not found') ? 404 : 400;
+        res.status(statusCode).json({ error: 'Profile Lookup Failed', message });
+      }
+    });
+
+    this.app.delete('/api/v1/profiles/:id', (req, res) => {
+      try {
+        const scope = this.normalizeProfileScope(req.query.scope) || this.config.browser.profiles.defaultScope;
+        const workspacePath = this.normalizeOptionalString(req.query.workspacePath);
+        this.browserSessionRegistry.deleteProfile(req.params.id, scope, workspacePath);
+        res.status(204).send();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = message.includes('not found') ? 404 : 400;
+        res.status(statusCode).json({ error: 'Profile Delete Failed', message });
+      }
+    });
+
+    this.app.post('/api/v1/profiles/:id/migrate', (req, res) => {
+      try {
+        const sourceScope = this.normalizeProfileScope(req.query.scope) || this.config.browser.profiles.defaultScope;
+        const sourceWorkspacePath = this.normalizeOptionalString(req.query.workspacePath);
+        const request = req.body as ProfileMigrationRequest;
+        const response = this.browserSessionRegistry.migrateProfile(
+          req.params.id,
+          sourceScope,
+          sourceWorkspacePath,
+          request
+        );
+        res.status(201).json(response);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        res.status(400).json({ error: 'Profile Migration Failed', message });
+      }
+    });
+
     this.app.post('/api/v1/sessions', async (req, res) => {
       const request = req.body as BrowserSessionRequest;
       const agentId = request.agentId?.trim();
@@ -193,6 +272,16 @@ export class HttpServer {
         return;
       }
 
+      const validationError = this.validateAccessRequest({
+        ...request,
+        agentId,
+        browserMode,
+      });
+      if (validationError) {
+        res.status(400).json({ error: 'Bad Request', message: validationError });
+        return;
+      }
+
       const budget = getBudgetManager().createBudget({
         timeoutMs: this.config.timeouts.defaultBudgetMs,
       });
@@ -203,6 +292,11 @@ export class HttpServer {
             agentId,
             browserMode,
             targetId: request.targetId,
+            stateMode: this.normalizeStateMode(request.stateMode) || undefined,
+            profileId: this.normalizeOptionalString(request.profileId),
+            profileScope: this.normalizeProfileScope(request.profileScope) || undefined,
+            workspacePath: this.normalizeOptionalString(request.workspacePath),
+            freshInstanceId: this.normalizeOptionalString(request.freshInstanceId),
           },
           budget
         );
@@ -246,6 +340,11 @@ export class HttpServer {
     this.app.delete('/api/v1/sessions/:id', async (req, res) => {
       const agentId = req.params.id;
       const browserMode = this.normalizeBrowserMode(req.query.browserMode);
+      const stateMode = this.normalizeStateMode(req.query.stateMode);
+      const profileScope = this.normalizeProfileScope(req.query.profileScope);
+      const workspacePath = this.normalizeOptionalString(req.query.workspacePath);
+      const profileId = this.normalizeOptionalString(req.query.profileId);
+      const freshInstanceId = this.normalizeOptionalString(req.query.freshInstanceId);
 
       if (req.query.browserMode !== undefined && !browserMode) {
         res.status(400).json({
@@ -258,7 +357,14 @@ export class HttpServer {
       try {
         const released = await this.browserSessionRegistry.releaseSession(
           agentId,
-          browserMode || undefined
+          browserMode || undefined,
+          {
+            stateMode: stateMode || undefined,
+            profileId: profileId || undefined,
+            profileScope: profileScope || undefined,
+            workspacePath: workspacePath || undefined,
+            freshInstanceId: freshInstanceId || undefined,
+          }
         );
 
         if (!released) {
@@ -298,12 +404,32 @@ export class HttpServer {
 
         const agentId = request.agentId?.trim() || 'default';
         const browserMode = this.normalizeBrowserMode(request.browserMode) || this.config.browser.defaultMode;
+        const stateMode = this.normalizeStateMode(request.stateMode) || undefined;
+        const profileScope = this.normalizeProfileScope(request.profileScope) || undefined;
+        const workspacePath = this.normalizeOptionalString(request.workspacePath);
+        const profileId = this.normalizeOptionalString(request.profileId);
+        const freshInstanceId = this.normalizeOptionalString(request.freshInstanceId);
 
         if (request.browserMode && !this.normalizeBrowserMode(request.browserMode)) {
           res.status(400).json({
             error: 'Bad Request',
             message: 'browserMode must be shared or dedicated',
           });
+          return;
+        }
+
+        const validationError = this.validateAccessRequest({
+          agentId,
+          browserMode,
+          stateMode,
+          profileId,
+          profileScope,
+          workspacePath,
+          freshInstanceId,
+          targetId: request.targetId,
+        });
+        if (validationError) {
+          res.status(400).json({ error: 'Bad Request', message: validationError });
           return;
         }
 
@@ -329,6 +455,11 @@ export class HttpServer {
               agentId,
               browserMode,
               targetId: request.targetId,
+              stateMode,
+              profileId,
+              profileScope,
+              workspacePath,
+              freshInstanceId,
             },
             requestBudget
           );
@@ -342,6 +473,8 @@ export class HttpServer {
             agentId,
             targetId: session.targetId,
             browserMode,
+            stateMode: session.stateMode,
+            profileId: session.profileId,
             browserInstanceId: session.browserInstanceId,
             isolationLevel: level,
             timeoutMs,
@@ -354,6 +487,11 @@ export class HttpServer {
             ...request,
             agentId,
             browserMode,
+            stateMode: session.stateMode,
+            profileId: session.profileId,
+            profileScope: session.profileScope,
+            workspacePath: session.workspacePath,
+            freshInstanceId,
             browserInstanceId: session.browserInstanceId,
             cdpUrl: session.cdpUrl,
             targetId: session.targetId,
@@ -471,14 +609,59 @@ export class HttpServer {
     return null;
   }
 
+  private normalizeStateMode(value: unknown): BrowserStateMode | null {
+    if (value === 'profile' || value === 'fresh') {
+      return value;
+    }
+    return null;
+  }
+
+  private normalizeProfileScope(value: unknown): ProfileStorageScope | null {
+    if (value === 'workspace' || value === 'global') {
+      return value;
+    }
+    return null;
+  }
+
+  private normalizeOptionalString(value: unknown): string | undefined {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+
+  private validateAccessRequest(request: {
+    agentId: string;
+    browserMode?: BrowserMode;
+    stateMode?: BrowserStateMode;
+    profileId?: string;
+    profileScope?: ProfileStorageScope;
+    workspacePath?: string;
+    freshInstanceId?: string;
+    targetId?: string;
+  }): string | null {
+    try {
+      this.profileManager.validateAccessRequest(request);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : 'Invalid browser access request';
+    }
+  }
+
   private isClientError(message: string): boolean {
     return [
       'targetId',
       'browserMode',
+      'stateMode',
+      'profileId',
+      'workspacePath',
+      'scope',
       'Dedicated browser mode is not enabled',
       'Dedicated browser instance limit reached',
       'not owned by agent',
       'not found',
+      'locked',
     ].some((fragment) => message.includes(fragment));
   }
 }

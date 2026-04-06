@@ -27,6 +27,11 @@ class CdpServiceClient {
       body: JSON.stringify({
         agentId: params.agentId || 'mcp-agent',
         browserMode: params.browserMode,
+        stateMode: params.stateMode,
+        profileId: params.profileId,
+        profileScope: params.profileScope,
+        workspacePath: params.workspacePath,
+        freshInstanceId: params.freshInstanceId,
         expression: params.expression,
         awaitPromise: params.awaitPromise !== false,
         returnByValue: params.returnByValue !== false,
@@ -57,6 +62,110 @@ class CdpServiceClient {
     });
     return response.json();
   }
+
+  async createProfile(params) {
+    const response = await fetch(`${this.serviceUrl}/api/v1/profiles`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.authToken}`,
+      },
+      body: JSON.stringify(params),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  async listProfiles(params = {}) {
+    const query = new URLSearchParams();
+    if (params.scope) query.set('scope', params.scope);
+    if (params.workspacePath) query.set('workspacePath', params.workspacePath);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const response = await fetch(`${this.serviceUrl}/api/v1/profiles${suffix}`, {
+      headers: {
+        Authorization: `Bearer ${this.authToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  async getProfile(params) {
+    const query = new URLSearchParams();
+    if (params.scope) query.set('scope', params.scope);
+    if (params.workspacePath) query.set('workspacePath', params.workspacePath);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const response = await fetch(`${this.serviceUrl}/api/v1/profiles/${encodeURIComponent(params.profileId)}${suffix}`, {
+      headers: {
+        Authorization: `Bearer ${this.authToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return response.json();
+  }
+
+  async deleteProfile(params) {
+    const query = new URLSearchParams();
+    if (params.scope) query.set('scope', params.scope);
+    if (params.workspacePath) query.set('workspacePath', params.workspacePath);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const response = await fetch(`${this.serviceUrl}/api/v1/profiles/${encodeURIComponent(params.profileId)}${suffix}`, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${this.authToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return { deleted: true };
+  }
+
+  async migrateProfile(params) {
+    const query = new URLSearchParams();
+    if (params.scope) query.set('scope', params.scope);
+    if (params.workspacePath) query.set('workspacePath', params.workspacePath);
+    const suffix = query.size > 0 ? `?${query.toString()}` : '';
+    const response = await fetch(`${this.serviceUrl}/api/v1/profiles/${encodeURIComponent(params.profileId)}/migrate${suffix}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.authToken}`,
+      },
+      body: JSON.stringify({
+        targetProfileId: params.targetProfileId,
+        targetScope: params.targetScope,
+        targetWorkspacePath: params.targetWorkspacePath,
+        mode: params.mode,
+        force: params.force,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return response.json();
+  }
 }
 
 const cdpClient = new CdpServiceClient({
@@ -83,6 +192,40 @@ const browserModeProperty = {
   description: 'Browser ownership mode: shared Chrome or dedicated per-agent Chrome',
 };
 
+const stateModeProperty = {
+  type: 'string',
+  enum: ['profile', 'fresh'],
+  description: 'Browser state mode: persistent profile or fresh temporary instance',
+};
+
+const profileScopeProperty = {
+  type: 'string',
+  enum: ['workspace', 'global'],
+  description: 'Profile storage scope: workspace-local or global shared storage',
+};
+
+const browserAccessProperties = {
+  agentId: {
+    type: 'string',
+    description: "Optional agent identifier (default: 'mcp-agent')",
+  },
+  browserMode: browserModeProperty,
+  stateMode: stateModeProperty,
+  profileId: {
+    type: 'string',
+    description: 'Persistent profile identifier to use when stateMode=profile',
+  },
+  profileScope: profileScopeProperty,
+  workspacePath: {
+    type: 'string',
+    description: 'Absolute workspace path used for workspace-scoped profiles',
+  },
+  freshInstanceId: {
+    type: 'string',
+    description: 'Optional explicit identifier for reusing a fresh instance within a task',
+  },
+};
+
 const TOOLS = [
   {
     name: 'browser_evaluate',
@@ -94,11 +237,7 @@ const TOOLS = [
           type: 'string',
           description: 'JavaScript code to execute in the browser',
         },
-        agentId: {
-          type: 'string',
-          description: "Optional agent identifier for session isolation (default: 'mcp-agent')",
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
         timeoutMs: {
           type: 'number',
           description: 'Timeout in milliseconds (default: 30000)',
@@ -121,11 +260,7 @@ const TOOLS = [
           type: 'string',
           description: 'The URL to navigate to',
         },
-        agentId: {
-          type: 'string',
-          description: "Optional agent identifier (default: 'mcp-agent')",
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
         waitForLoad: {
           type: 'boolean',
           description: 'Wait for page load completion (default: true)',
@@ -144,11 +279,7 @@ const TOOLS = [
           type: 'string',
           description: 'CSS selector of the element to click',
         },
-        agentId: {
-          type: 'string',
-          description: 'Optional agent identifier',
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
       },
       required: ['selector'],
     },
@@ -167,11 +298,7 @@ const TOOLS = [
           type: 'string',
           description: 'Text value to fill',
         },
-        agentId: {
-          type: 'string',
-          description: 'Optional agent identifier',
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
       },
       required: ['selector', 'value'],
     },
@@ -237,11 +364,7 @@ const TOOLS = [
           type: 'boolean',
           description: 'Include cookies in response (default: false)',
         },
-        agentId: {
-          type: 'string',
-          description: 'Optional agent identifier',
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
       },
     },
   },
@@ -258,11 +381,7 @@ const TOOLS = [
             type: 'string',
           },
         },
-        agentId: {
-          type: 'string',
-          description: 'Optional agent identifier',
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
       },
       required: ['selectors'],
     },
@@ -285,12 +404,120 @@ const TOOLS = [
           type: 'number',
           description: 'Maximum wait time in milliseconds (default: 30000)',
         },
-        agentId: {
-          type: 'string',
-          description: 'Optional agent identifier',
-        },
-        browserMode: browserModeProperty,
+        ...browserAccessProperties,
       },
+    },
+  },
+  {
+    name: 'browser_profile_create',
+    description: 'Create a persistent browser profile',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        profileId: {
+          type: 'string',
+          description: 'Profile identifier to create',
+        },
+        scope: profileScopeProperty,
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for workspace-scoped profiles',
+        },
+        displayName: {
+          type: 'string',
+          description: 'Optional human-friendly display name',
+        },
+      },
+      required: ['profileId'],
+    },
+  },
+  {
+    name: 'browser_profile_list',
+    description: 'List browser profiles',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: profileScopeProperty,
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for workspace-scoped profiles',
+        },
+      },
+    },
+  },
+  {
+    name: 'browser_profile_get',
+    description: 'Get a browser profile',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        profileId: {
+          type: 'string',
+          description: 'Profile identifier to fetch',
+        },
+        scope: profileScopeProperty,
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for workspace-scoped profiles',
+        },
+      },
+      required: ['profileId'],
+    },
+  },
+  {
+    name: 'browser_profile_delete',
+    description: 'Delete a browser profile',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        profileId: {
+          type: 'string',
+          description: 'Profile identifier to delete',
+        },
+        scope: profileScopeProperty,
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for workspace-scoped profiles',
+        },
+      },
+      required: ['profileId'],
+    },
+  },
+  {
+    name: 'browser_profile_migrate',
+    description: 'Migrate or copy a browser profile between workspace/global scopes',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        profileId: {
+          type: 'string',
+          description: 'Source profile identifier',
+        },
+        scope: profileScopeProperty,
+        workspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for source workspace-scoped profiles',
+        },
+        targetProfileId: {
+          type: 'string',
+          description: 'Optional destination profile identifier; defaults to source profileId',
+        },
+        targetScope: profileScopeProperty,
+        targetWorkspacePath: {
+          type: 'string',
+          description: 'Absolute workspace path for destination workspace-scoped profiles',
+        },
+        mode: {
+          type: 'string',
+          enum: ['copy', 'move'],
+          description: 'Whether to copy or move the source profile',
+        },
+        force: {
+          type: 'boolean',
+          description: 'Allow migrating even if the source profile is currently locked',
+        },
+      },
+      required: ['profileId', 'targetScope'],
     },
   },
   {
@@ -765,6 +992,11 @@ async function evaluateWithBrowserMode(args, expression, timeoutMs, extra = {}) 
   return cdpClient.evaluate({
     agentId: args.agentId,
     browserMode: args.browserMode,
+    stateMode: args.stateMode,
+    profileId: args.profileId,
+    profileScope: args.profileScope,
+    workspacePath: args.workspacePath,
+    freshInstanceId: args.freshInstanceId,
     expression,
     budget: { timeoutMs: timeoutMs || cdpClient.defaultTimeout },
     ...extra,
@@ -898,6 +1130,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const evalResult = await cdpClient.evaluate({
           agentId: args.agentId,
           browserMode: args.browserMode,
+          stateMode: args.stateMode,
+          profileId: args.profileId,
+          profileScope: args.profileScope,
+          workspacePath: args.workspacePath,
+          freshInstanceId: args.freshInstanceId,
           expression: args.expression,
           awaitPromise: args.awaitPromise,
           budget: { timeoutMs: args.timeoutMs },
@@ -974,6 +1211,66 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
         return {
           content: [{ type: 'text', text: 'Wait condition met' }],
+        };
+      }
+
+      case 'browser_profile_create': {
+        const profile = await cdpClient.createProfile({
+          profileId: args.profileId,
+          scope: args.scope,
+          workspacePath: args.workspacePath,
+          displayName: args.displayName,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(profile, null, 2) }],
+        };
+      }
+
+      case 'browser_profile_list': {
+        const profiles = await cdpClient.listProfiles({
+          scope: args.scope,
+          workspacePath: args.workspacePath,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(profiles, null, 2) }],
+        };
+      }
+
+      case 'browser_profile_get': {
+        const profile = await cdpClient.getProfile({
+          profileId: args.profileId,
+          scope: args.scope,
+          workspacePath: args.workspacePath,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(profile, null, 2) }],
+        };
+      }
+
+      case 'browser_profile_delete': {
+        const result = await cdpClient.deleteProfile({
+          profileId: args.profileId,
+          scope: args.scope,
+          workspacePath: args.workspacePath,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case 'browser_profile_migrate': {
+        const result = await cdpClient.migrateProfile({
+          profileId: args.profileId,
+          scope: args.scope,
+          workspacePath: args.workspacePath,
+          targetProfileId: args.targetProfileId,
+          targetScope: args.targetScope,
+          targetWorkspacePath: args.targetWorkspacePath,
+          mode: args.mode,
+          force: args.force,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         };
       }
 

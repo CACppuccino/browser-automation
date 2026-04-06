@@ -4,7 +4,7 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parse } from 'yaml';
-import type { ServiceConfig } from './types.js';
+import type { ProfileStorageScope, ServiceConfig } from './types.js';
 
 const DEFAULT_CONFIG_PATH = './config.yaml';
 
@@ -25,6 +25,20 @@ export function loadConfig(configPath: string = DEFAULT_CONFIG_PATH): ServiceCon
         substituteEnvVars(config.browser.dedicated.userDataDirBase)
       );
       mkdirSync(config.browser.dedicated.userDataDirBase, { recursive: true });
+    }
+
+    if (config.browser?.profiles?.globalRootDir) {
+      config.browser.profiles.globalRootDir = resolve(
+        substituteEnvVars(config.browser.profiles.globalRootDir)
+      );
+      mkdirSync(config.browser.profiles.globalRootDir, { recursive: true });
+    }
+
+    if (config.browser?.profiles?.migration?.tempDir) {
+      config.browser.profiles.migration.tempDir = resolve(
+        substituteEnvVars(config.browser.profiles.migration.tempDir)
+      );
+      mkdirSync(config.browser.profiles.migration.tempDir, { recursive: true });
     }
 
     // Validate configuration
@@ -124,6 +138,29 @@ function validateConfig(config: ServiceConfig): void {
   } else if (config.browser.defaultMode === 'dedicated') {
     throw new Error('browser.defaultMode cannot be dedicated when browser.dedicated.enabled is false');
   }
+
+  const profiles = config.browser.profiles;
+  if (!profiles.workspaceRootName) {
+    throw new Error('browser.profiles.workspaceRootName is required');
+  }
+  if (!profiles.globalRootDir) {
+    throw new Error('browser.profiles.globalRootDir is required');
+  }
+  if (!['workspace', 'global'].includes(profiles.defaultScope)) {
+    throw new Error('browser.profiles.defaultScope must be workspace or global');
+  }
+  if (!profiles.metadataFileName) {
+    throw new Error('browser.profiles.metadataFileName is required');
+  }
+  if (!profiles.lockFileName) {
+    throw new Error('browser.profiles.lockFileName is required');
+  }
+  if (profiles.lockTimeoutMs < 1000) {
+    throw new Error('browser.profiles.lockTimeoutMs must be at least 1000ms');
+  }
+  if (!profiles.migration?.tempDir) {
+    throw new Error('browser.profiles.migration.tempDir is required');
+  }
 }
 
 export function getDefaultConfig(): ServiceConfig {
@@ -167,6 +204,23 @@ export function getDefaultConfig(): ServiceConfig {
         headless: false,
         userDataDirBase: resolve('/tmp/browser-automation-sessions'),
         extraArgs: [],
+      },
+      profiles: {
+        workspaceRootName: '.browser-automation/profiles',
+        globalRootDir: resolve('/tmp/browser-automation-profiles'),
+        defaultScope: 'workspace' as ProfileStorageScope,
+        metadataFileName: 'profile.json',
+        lockFileName: 'lock',
+        lockTimeoutMs: 30000,
+        retention: {
+          keepWorkspaceProfiles: true,
+          keepGlobalProfiles: true,
+          cleanupFreshOnShutdown: true,
+          cleanupFreshOnIdle: true,
+        },
+        migration: {
+          tempDir: resolve('/tmp/browser-automation-profile-migrations'),
+        },
       },
       target: {
         createUrl: 'about:blank',

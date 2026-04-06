@@ -36,6 +36,20 @@ browser:
     headless: false
     userDataDirBase: /tmp/browser-automation-sessions
     extraArgs: []
+  profiles:
+    workspaceRootName: .browser-automation/profiles
+    globalRootDir: /tmp/browser-automation-profiles
+    defaultScope: workspace
+    metadataFileName: profile.json
+    lockFileName: lock
+    lockTimeoutMs: 30000
+    retention:
+      keepWorkspaceProfiles: true
+      keepGlobalProfiles: true
+      cleanupFreshOnShutdown: true
+      cleanupFreshOnIdle: true
+    migration:
+      tempDir: /tmp/browser-automation-profile-migrations
   target:
     createUrl: about:blank
     enforceOwnership: true

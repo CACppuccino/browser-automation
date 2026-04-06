@@ -1,10 +1,9 @@
 /**
- * Chrome launcher for dedicated per-agent browser instances.
+ * Chrome launcher for dedicated browser instances.
  */
 import { mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import type { BrowserInstanceRecord, ServiceConfig } from './types.js';
+import type { BrowserInstanceRecord, BrowserStateMode, ProfileStorageScope, ServiceConfig } from './types.js';
 import { getLogger } from './logger.js';
 
 function sleep(ms: number): Promise<void> {
@@ -32,6 +31,17 @@ async function waitForEndpoint(cdpUrl: string, timeoutMs: number): Promise<void>
   throw new Error(`Timed out waiting for Chrome endpoint ${cdpUrl}`);
 }
 
+export interface LaunchBrowserOptions {
+  instanceKey: string;
+  agentId: string;
+  stateMode: BrowserStateMode;
+  userDataDir: string;
+  deleteUserDataDirOnShutdown: boolean;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
+}
+
 export class ChromeLauncher {
   private config: ServiceConfig['browser']['dedicated'];
 
@@ -39,7 +49,7 @@ export class ChromeLauncher {
     this.config = config;
   }
 
-  async launch(agentId: string, port: number): Promise<{
+  async launch(options: LaunchBrowserOptions, port: number): Promise<{
     instance: BrowserInstanceRecord;
     process: ChildProcess;
   }> {
@@ -51,14 +61,12 @@ export class ChromeLauncher {
     }
 
     const logger = getLogger();
-    const instanceId = `dedicated-${agentId}`;
-    const userDataDir = join(this.config.userDataDirBase, sanitizeSegment(agentId));
-    mkdirSync(userDataDir, { recursive: true });
+    mkdirSync(options.userDataDir, { recursive: true });
 
     const args = [
       `--remote-debugging-port=${port}`,
       `--remote-debugging-address=${this.config.host}`,
-      `--user-data-dir=${userDataDir}`,
+      `--user-data-dir=${options.userDataDir}`,
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-background-networking',
@@ -77,9 +85,13 @@ export class ChromeLauncher {
     ];
 
     logger.info('Launching dedicated Chrome instance', {
-      agentId,
+      instanceKey: options.instanceKey,
+      agentId: options.agentId,
+      stateMode: options.stateMode,
+      profileId: options.profileId,
+      profileScope: options.profileScope,
       port,
-      userDataDir,
+      userDataDir: options.userDataDir,
       headless: this.config.headless,
     });
 
@@ -106,13 +118,20 @@ export class ChromeLauncher {
     const now = Date.now();
     return {
       instance: {
-        instanceId,
+        instanceId: options.instanceKey,
+        instanceKey: options.instanceKey,
         mode: 'dedicated',
+        stateMode: options.stateMode,
         cdpUrl,
-        ownerAgentId: agentId,
+        ownerAgentId: options.agentId,
         port,
         pid: childProcess.pid,
-        userDataDir,
+        userDataDir: options.userDataDir,
+        profileId: options.profileId,
+        profileScope: options.profileScope,
+        workspacePath: options.workspacePath,
+        profileRootDir: options.profileId ? options.userDataDir.replace(/\/user-data$/, '') : undefined,
+        deleteUserDataDirOnShutdown: options.deleteUserDataDirOnShutdown,
         createdAt: now,
         lastUsedAt: now,
         status: 'ready',
@@ -142,7 +161,7 @@ export class ChromeLauncher {
       }
     }
 
-    if (instance.userDataDir) {
+    if (instance.userDataDir && instance.deleteUserDataDirOnShutdown) {
       try {
         rmSync(instance.userDataDir, { recursive: true, force: true });
       } catch {
@@ -150,8 +169,4 @@ export class ChromeLauncher {
       }
     }
   }
-}
-
-function sanitizeSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_-]+/g, '-');
 }

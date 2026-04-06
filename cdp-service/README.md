@@ -74,8 +74,23 @@ curl http://localhost:3100/health
 
 ### 浏览器模式说明
 
+#### 浏览器所有权
 - `shared` 模式复用你提供的 CDP Chrome（例如 `http://localhost:9222`）
 - `dedicated` 模式为每个 agent 启动独立 Chrome 实例
+
+#### 浏览器状态模型
+- `stateMode: "profile"`：使用持久 profile，保留 cookies、localStorage、缓存、IndexedDB、Service Worker 与完整 Chrome `user-data-dir`
+- `stateMode: "fresh"`：使用一次性临时实例，适合 clean-room 访问与无状态验证
+
+#### Profile 存储范围
+- `profileScope: "workspace"`：默认模式，profile 存储在 `<workspacePath>/.browser-automation/profiles/<profileId>/`
+- `profileScope: "global"`：profile 存储在全局目录，适合跨 workspace 复用长期浏览器身份
+
+#### 关键规则
+- `shared` 不支持 `stateMode: "fresh"`
+- `shared` 不支持显式选择 `profileId`
+- `dedicated + profile` 需要 `profileId`
+- `profileScope: "workspace"` 时需要绝对路径 `workspacePath`
 - `browser.dedicated.headless` 控制 dedicated 实例是否无头运行
 - 默认配置现在是 `headless: false`，也就是有头模式，便于观察执行过程并降低部分站点对无头浏览器的风控命中率
 - 如需恢复无头模式，把 `config.yaml` 或 `config-optimized.yaml` 中的 `browser.dedicated.headless` 改为 `true`
@@ -192,6 +207,20 @@ browser:
     headless: false
     userDataDirBase: /tmp/browser-automation-sessions
     extraArgs: []
+  profiles:
+    workspaceRootName: .browser-automation/profiles
+    globalRootDir: /tmp/browser-automation-profiles
+    defaultScope: workspace
+    metadataFileName: profile.json
+    lockFileName: lock
+    lockTimeoutMs: 30000
+    retention:
+      keepWorkspaceProfiles: true
+      keepGlobalProfiles: true
+      cleanupFreshOnShutdown: true
+      cleanupFreshOnIdle: true
+    migration:
+      tempDir: /tmp/browser-automation-profile-migrations
   target:
     createUrl: about:blank
     enforceOwnership: true
@@ -284,6 +313,11 @@ const client = new CdpServiceClient({
 
 const result = await client.evaluate({
   agentId: 'my-agent',
+  browserMode: 'dedicated',
+  stateMode: 'profile',
+  profileId: 'linkedin-main',
+  profileScope: 'workspace',
+  workspacePath: '/absolute/path/to/workspace',
   expression: 'document.title',
   budget: { timeoutMs: 5000 }
 });

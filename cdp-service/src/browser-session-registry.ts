@@ -3,12 +3,14 @@
  */
 import type { ChildProcess } from 'node:child_process';
 import type {
+  BrowserAccessRequest,
   BrowserInstanceRecord,
   BrowserMode,
   BrowserSessionRecord,
   BrowserSessionRequest,
   BrowserSessionResponse,
   Budget,
+  ProfileRecord,
   ServiceConfig,
 } from './types.js';
 import { ChromeLauncher } from './chrome-launcher.js';
@@ -20,6 +22,7 @@ import {
   getTargetWebSocketUrl,
   targetExists,
 } from './cdp-helpers.js';
+import { ProfileManager } from './profile-manager.js';
 
 interface DedicatedRuntime {
   instance: BrowserInstanceRecord;
@@ -29,6 +32,7 @@ interface DedicatedRuntime {
 export class BrowserSessionRegistry {
   private config: ServiceConfig['browser'];
   private launcher: ChromeLauncher | null;
+  private profileManager: ProfileManager;
   private sharedInstance: BrowserInstanceRecord;
   private sessions = new Map<string, BrowserSessionRecord>();
   private dedicatedInstances = new Map<string, DedicatedRuntime>();
@@ -39,10 +43,14 @@ export class BrowserSessionRegistry {
   constructor(config: ServiceConfig['browser']) {
     this.config = config;
     this.launcher = config.dedicated.enabled ? new ChromeLauncher(config.dedicated) : null;
+    this.profileManager = new ProfileManager(config);
     this.sharedInstance = {
       instanceId: 'shared-default',
+      instanceKey: 'shared:default',
       mode: 'shared',
+      stateMode: 'profile',
       cdpUrl: config.shared.cdpUrl,
+      deleteUserDataDirOnShutdown: false,
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
       status: 'ready',
@@ -73,35 +81,48 @@ export class BrowserSessionRegistry {
     request: BrowserSessionRequest,
     budget: Budget
   ): Promise<BrowserSessionRecord> {
-    const agentId = request.agentId;
-    const browserMode = request.browserMode ?? this.config.defaultMode;
-    const sessionKey = this.makeSessionKey(agentId, browserMode);
+    const normalized = this.profileManager.normalizeAccessRequest(request);
+    this.profileManager.validateAccessRequest(normalized);
+
+    const sessionKey = this.makeSessionKey(normalized);
+    const instanceKey = this.makeInstanceKey(normalized);
 
     const existingSession = this.sessions.get(sessionKey);
     if (existingSession) {
-      if (request.targetId && request.targetId !== existingSession.targetId && this.config.target.enforceOwnership) {
+      if (normalized.targetId && normalized.targetId !== existingSession.targetId && this.config.target.enforceOwnership) {
         throw new Error(
-          `targetId ${request.targetId} is not owned by agent ${agentId} in ${browserMode} mode`
+          `targetId ${normalized.targetId} is not owned by agent ${normalized.agentId} in ${normalized.browserMode} mode`
         );
       }
 
       if (!(await this.validateSession(existingSession, budget))) {
-        await this.releaseSession(agentId, browserMode);
+        await this.releaseSession(normalized.agentId, normalized.browserMode, {
+          stateMode: normalized.stateMode,
+          profileId: normalized.profileId,
+          profileScope: normalized.profileScope,
+          workspacePath: normalized.workspacePath,
+          freshInstanceId: normalized.freshInstanceId,
+        });
       } else {
         existingSession.lastUsedAt = Date.now();
-        this.touchInstance(existingSession.browserInstanceId);
+        this.touchInstance(existingSession.instanceKey);
         return existingSession;
       }
     }
 
-    const instance = await this.resolveBrowserInstance(agentId, browserMode, budget);
+    const instance = await this.resolveBrowserInstance(normalized, budget);
     const pageTarget = await createPageTarget(instance.cdpUrl, this.config.target.createUrl, budget);
     const now = Date.now();
 
     const session: BrowserSessionRecord = {
       sessionKey,
-      agentId,
-      browserMode,
+      instanceKey,
+      agentId: normalized.agentId,
+      browserMode: normalized.browserMode!,
+      stateMode: normalized.stateMode!,
+      profileId: normalized.profileId,
+      profileScope: normalized.profileScope,
+      workspacePath: normalized.workspacePath,
       browserInstanceId: instance.instanceId,
       cdpUrl: instance.cdpUrl,
       targetId: pageTarget.id,
@@ -111,11 +132,13 @@ export class BrowserSessionRegistry {
 
     this.sessions.set(sessionKey, session);
     this.targetOwners.set(pageTarget.id, sessionKey);
-    this.touchInstance(instance.instanceId);
+    this.touchInstance(instance.instanceKey);
 
     getLogger().info('Created browser session', {
-      agentId,
-      browserMode,
+      agentId: normalized.agentId,
+      browserMode: normalized.browserMode,
+      stateMode: normalized.stateMode,
+      profileId: normalized.profileId,
       browserInstanceId: session.browserInstanceId,
       targetId: session.targetId,
     });
@@ -124,29 +147,52 @@ export class BrowserSessionRegistry {
   }
 
   async getSession(agentId: string, browserMode?: BrowserMode): Promise<BrowserSessionRecord | null> {
-    if (browserMode) {
-      return this.sessions.get(this.makeSessionKey(agentId, browserMode)) || null;
+    const matches = Array.from(this.sessions.values()).filter(
+      (session) => session.agentId === agentId && (!browserMode || session.browserMode === browserMode)
+    );
+
+    if (matches.length === 0) {
+      return null;
     }
 
-    return (
-      this.sessions.get(this.makeSessionKey(agentId, 'dedicated')) ||
-      this.sessions.get(this.makeSessionKey(agentId, 'shared')) ||
-      null
-    );
+    matches.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    return matches[0];
   }
 
-  async releaseSession(agentId: string, browserMode?: BrowserMode): Promise<boolean> {
-    const candidates: BrowserMode[] = browserMode ? [browserMode] : ['shared', 'dedicated'];
+  async releaseSession(
+    agentId: string,
+    browserMode?: BrowserMode,
+    options?: Partial<BrowserAccessRequest>
+  ): Promise<boolean> {
+    const matches = Array.from(this.sessions.values()).filter((session) => {
+      if (session.agentId !== agentId) {
+        return false;
+      }
+      if (browserMode && session.browserMode !== browserMode) {
+        return false;
+      }
+      if (options?.stateMode && session.stateMode !== options.stateMode) {
+        return false;
+      }
+      if (options?.profileId && session.profileId !== options.profileId) {
+        return false;
+      }
+      if (options?.profileScope && session.profileScope !== options.profileScope) {
+        return false;
+      }
+      if (options?.workspacePath && session.workspacePath !== options.workspacePath) {
+        return false;
+      }
+      if (options?.freshInstanceId && !session.instanceKey.endsWith(`:${options.freshInstanceId}`)) {
+        return false;
+      }
+      return true;
+    });
+
     let released = false;
 
-    for (const mode of candidates) {
-      const sessionKey = this.makeSessionKey(agentId, mode);
-      const session = this.sessions.get(sessionKey);
-      if (!session) {
-        continue;
-      }
-
-      this.sessions.delete(sessionKey);
+    for (const session of matches) {
+      this.sessions.delete(session.sessionKey);
       this.targetOwners.delete(session.targetId);
       released = true;
 
@@ -169,17 +215,29 @@ export class BrowserSessionRegistry {
       } catch (error) {
         getLogger().warn('Failed to delete page target during session cleanup', {
           agentId,
-          browserMode: mode,
+          browserMode: session.browserMode,
           targetId: session.targetId,
           error: error instanceof Error ? error.message : String(error),
         });
       }
 
-      if (mode === 'dedicated') {
-        const runtime = this.dedicatedInstances.get(agentId);
+      if (session.browserMode === 'dedicated') {
+        const runtime = this.dedicatedInstances.get(session.instanceKey);
         if (runtime) {
-          this.dedicatedInstances.delete(agentId);
+          this.dedicatedInstances.delete(session.instanceKey);
           await this.launcher?.shutdown(runtime.instance, runtime.process);
+          if (session.profileId && session.profileScope) {
+            try {
+              const profile = this.profileManager.readProfileRecord(
+                session.profileId,
+                session.profileScope,
+                session.workspacePath
+              );
+              this.profileManager.releaseProfileLock(profile, session.instanceKey);
+            } catch {
+              // ignore lock cleanup failures
+            }
+          }
         }
       }
     }
@@ -192,7 +250,12 @@ export class BrowserSessionRegistry {
 
     const sessions = Array.from(this.sessions.values());
     for (const session of sessions) {
-      await this.releaseSession(session.agentId, session.browserMode);
+      await this.releaseSession(session.agentId, session.browserMode, {
+        stateMode: session.stateMode,
+        profileId: session.profileId,
+        profileScope: session.profileScope,
+        workspacePath: session.workspacePath,
+      });
     }
   }
 
@@ -221,6 +284,8 @@ export class BrowserSessionRegistry {
       sessions: Array.from(this.sessions.values()).map((session) => ({
         agentId: session.agentId,
         browserMode: session.browserMode,
+        stateMode: session.stateMode,
+        profileId: session.profileId,
         browserInstanceId: session.browserInstanceId,
         targetId: session.targetId,
         lastUsedAt: session.lastUsedAt,
@@ -232,6 +297,10 @@ export class BrowserSessionRegistry {
     return {
       agentId: session.agentId,
       browserMode: session.browserMode,
+      stateMode: session.stateMode,
+      profileId: session.profileId,
+      profileScope: session.profileScope,
+      workspacePath: session.workspacePath,
       browserInstanceId: session.browserInstanceId,
       cdpUrl: session.cdpUrl,
       targetId: session.targetId,
@@ -248,12 +317,31 @@ export class BrowserSessionRegistry {
     return getTargetWebSocketUrl(session.cdpUrl, session.targetId, budget);
   }
 
+  createProfile(record: { profileId: string; scope?: 'workspace' | 'global'; workspacePath?: string; displayName?: string }) {
+    return this.profileManager.createProfile(record);
+  }
+
+  listProfiles(scope?: 'workspace' | 'global', workspacePath?: string) {
+    return this.profileManager.listProfiles(scope, workspacePath);
+  }
+
+  getProfile(profileId: string, scope: 'workspace' | 'global', workspacePath?: string) {
+    return this.profileManager.getProfile(profileId, scope, workspacePath);
+  }
+
+  deleteProfile(profileId: string, scope: 'workspace' | 'global', workspacePath?: string) {
+    return this.profileManager.deleteProfile(profileId, scope, workspacePath);
+  }
+
+  migrateProfile(profileId: string, scope: 'workspace' | 'global', workspacePath: string | undefined, request: any) {
+    return this.profileManager.migrateProfile(profileId, scope, workspacePath, request);
+  }
+
   private async resolveBrowserInstance(
-    agentId: string,
-    browserMode: BrowserMode,
+    request: BrowserAccessRequest,
     budget: Budget
   ): Promise<BrowserInstanceRecord> {
-    if (browserMode === 'shared') {
+    if (request.browserMode === 'shared') {
       this.sharedInstance.lastUsedAt = Date.now();
       await getBrowserWebSocketUrl(this.sharedInstance.cdpUrl, budget);
       return this.sharedInstance;
@@ -263,7 +351,8 @@ export class BrowserSessionRegistry {
       throw new Error('Dedicated browser mode is not enabled');
     }
 
-    const existing = this.dedicatedInstances.get(agentId);
+    const instanceKey = this.makeInstanceKey(request);
+    const existing = this.dedicatedInstances.get(instanceKey);
     if (existing) {
       existing.instance.lastUsedAt = Date.now();
       return existing.instance;
@@ -273,9 +362,43 @@ export class BrowserSessionRegistry {
       throw new Error('Dedicated browser instance limit reached');
     }
 
-    const runtime = await this.launcher.launch(agentId, this.allocatePort());
-    this.dedicatedInstances.set(agentId, runtime);
-    return runtime.instance;
+    const accessContext = this.profileManager.resolveAccessContext(request);
+    let lockedProfile: ProfileRecord | null = null;
+    if (accessContext.stateMode === 'profile' && accessContext.profileId && accessContext.profileScope) {
+      lockedProfile = this.profileManager.readProfileRecord(
+        accessContext.profileId,
+        accessContext.profileScope,
+        accessContext.workspacePath
+      );
+      this.profileManager.acquireProfileLock(lockedProfile, {
+        instanceKey,
+        agentId: request.agentId,
+        timestamp: Date.now(),
+      });
+    }
+
+    try {
+      const runtime = await this.launcher.launch(
+        {
+          instanceKey,
+          agentId: request.agentId,
+          stateMode: accessContext.stateMode,
+          profileId: accessContext.profileId,
+          profileScope: accessContext.profileScope,
+          workspacePath: accessContext.workspacePath,
+          userDataDir: accessContext.paths.userDataDir,
+          deleteUserDataDirOnShutdown: accessContext.deleteUserDataDirOnShutdown,
+        },
+        this.allocatePort()
+      );
+      this.dedicatedInstances.set(instanceKey, runtime);
+      return runtime.instance;
+    } catch (error) {
+      if (lockedProfile) {
+        this.profileManager.releaseProfileLock(lockedProfile, instanceKey);
+      }
+      throw error;
+    }
   }
 
   private async validateSession(session: BrowserSessionRecord, budget: Budget): Promise<boolean> {
@@ -287,15 +410,13 @@ export class BrowserSessionRegistry {
     }
   }
 
-  private touchInstance(instanceId: string): void {
-    if (instanceId === this.sharedInstance.instanceId) {
+  private touchInstance(instanceKey: string): void {
+    if (instanceKey === this.sharedInstance.instanceKey) {
       this.sharedInstance.lastUsedAt = Date.now();
       return;
     }
 
-    const runtime = Array.from(this.dedicatedInstances.values()).find(
-      ({ instance }) => instance.instanceId === instanceId
-    );
+    const runtime = this.dedicatedInstances.get(instanceKey);
     if (runtime) {
       runtime.instance.lastUsedAt = Date.now();
     }
@@ -311,27 +432,39 @@ export class BrowserSessionRegistry {
     const idleBefore = Date.now() - this.config.dedicated.idleTimeoutMs;
 
     for (const session of Array.from(this.sessions.values())) {
-      if (session.browserMode !== 'dedicated') {
+      if (session.lastUsedAt >= idleBefore) {
         continue;
       }
-      if (session.lastUsedAt < idleBefore) {
-        await this.releaseSession(session.agentId, session.browserMode);
+      if (session.stateMode === 'profile' && !this.config.profiles.retention.cleanupFreshOnIdle) {
+        continue;
       }
-    }
-
-    const sharedSessionKeys = Array.from(this.sessions.entries())
-      .filter(([, session]) => session.browserMode === 'shared' && session.lastUsedAt < idleBefore)
-      .map(([key]) => key);
-
-    for (const sessionKey of sharedSessionKeys) {
-      const session = this.sessions.get(sessionKey);
-      if (session) {
-        await this.releaseSession(session.agentId, 'shared');
-      }
+      await this.releaseSession(session.agentId, session.browserMode, {
+        stateMode: session.stateMode,
+        profileId: session.profileId,
+        profileScope: session.profileScope,
+        workspacePath: session.workspacePath,
+      });
     }
   }
 
-  private makeSessionKey(agentId: string, browserMode: BrowserMode): string {
-    return `${browserMode}:${agentId}`;
+  private makeSessionKey(request: BrowserAccessRequest): string {
+    const normalized = this.profileManager.normalizeAccessRequest(request);
+    return `${this.makeInstanceKey(normalized)}:agent:${normalized.agentId}`;
   }
+
+  private makeInstanceKey(request: BrowserAccessRequest): string {
+    const normalized = this.profileManager.normalizeAccessRequest(request);
+    if (normalized.browserMode === 'shared') {
+      return 'shared:default';
+    }
+    if (normalized.stateMode === 'profile') {
+      const workspaceSegment = normalized.profileScope === 'workspace' ? `:${sanitizeSegment(normalized.workspacePath || '')}` : '';
+      return `dedicated:profile:${normalized.profileScope}:${normalized.profileId}${workspaceSegment}`;
+    }
+    return `dedicated:fresh:${normalized.agentId}:${normalized.freshInstanceId || 'auto'}`;
+  }
+}
+
+function sanitizeSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, '-');
 }

@@ -4,6 +4,9 @@
 
 export type IsolationLevel = 'process' | 'context' | 'session';
 export type BrowserMode = 'shared' | 'dedicated';
+export type BrowserStateMode = 'profile' | 'fresh';
+export type ProfileStorageScope = 'workspace' | 'global';
+export type ProfileMigrationMode = 'copy' | 'move';
 
 export interface ServiceConfig {
   service: {
@@ -45,6 +48,23 @@ export interface ServiceConfig {
       headless: boolean;
       userDataDirBase: string;
       extraArgs?: string[];
+    };
+    profiles: {
+      workspaceRootName: string;
+      globalRootDir: string;
+      defaultScope: ProfileStorageScope;
+      metadataFileName: string;
+      lockFileName: string;
+      lockTimeoutMs: number;
+      retention: {
+        keepWorkspaceProfiles: boolean;
+        keepGlobalProfiles: boolean;
+        cleanupFreshOnShutdown: boolean;
+        cleanupFreshOnIdle: boolean;
+      };
+      migration: {
+        tempDir: string;
+      };
     };
     target: {
       createUrl: string;
@@ -107,11 +127,27 @@ export interface Budget {
   cleanup(): void;
 }
 
+export interface BrowserAccessRequest {
+  agentId: string;
+  browserMode?: BrowserMode;
+  targetId?: string;
+  stateMode?: BrowserStateMode;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
+  freshInstanceId?: string;
+}
+
 export interface EvaluateRequest {
   sessionId?: string;
   agentId?: string;
   targetId?: string;
   browserMode?: BrowserMode;
+  stateMode?: BrowserStateMode;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
+  freshInstanceId?: string;
   expression: string;
   awaitPromise?: boolean;
   returnByValue?: boolean;
@@ -123,6 +159,7 @@ export interface EvaluateRequest {
 export interface EngineEvaluateRequest extends EvaluateRequest {
   agentId: string;
   browserMode: BrowserMode;
+  stateMode: BrowserStateMode;
   browserInstanceId: string;
   cdpUrl: string;
   targetId: string;
@@ -141,6 +178,7 @@ export interface EvaluateResponse {
     isolationLevel: IsolationLevel;
     engineId: string;
     browserMode?: BrowserMode;
+    stateMode?: BrowserStateMode;
     browserInstanceId?: string;
     targetId?: string;
     terminatedViaSignal?: boolean;
@@ -153,14 +191,53 @@ export interface LoadMetrics {
   memoryUsage: number;
 }
 
+export interface ProfileStoragePaths {
+  rootDir: string;
+  userDataDir: string;
+  metadataPath: string;
+  lockPath: string;
+}
+
+export interface ProfileRecord {
+  profileId: string;
+  scope: ProfileStorageScope;
+  workspacePath?: string;
+  displayName?: string;
+  rootDir: string;
+  userDataDir: string;
+  metadataPath: string;
+  lockPath: string;
+  createdAt: number;
+  updatedAt: number;
+  lastUsedAt: number;
+  state: 'ready' | 'migrating' | 'locked' | 'error';
+  version: number;
+  sourceProfileId?: string;
+  sourceScope?: ProfileStorageScope;
+  migratedFrom?: {
+    profileId: string;
+    scope: ProfileStorageScope;
+    workspacePath?: string;
+    migratedAt: number;
+    mode: ProfileMigrationMode;
+  };
+}
+
 export interface BrowserInstanceRecord {
   instanceId: string;
+  instanceKey: string;
   mode: BrowserMode;
+  stateMode: BrowserStateMode;
   cdpUrl: string;
   ownerAgentId?: string;
   port?: number;
   pid?: number;
   userDataDir?: string;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
+  profileRootDir?: string;
+  deleteUserDataDirOnShutdown: boolean;
   createdAt: number;
   lastUsedAt: number;
   status: 'starting' | 'ready' | 'stopping' | 'error';
@@ -168,8 +245,13 @@ export interface BrowserInstanceRecord {
 
 export interface BrowserSessionRecord {
   sessionKey: string;
+  instanceKey: string;
   agentId: string;
   browserMode: BrowserMode;
+  stateMode: BrowserStateMode;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
   browserInstanceId: string;
   cdpUrl: string;
   targetId: string;
@@ -177,18 +259,41 @@ export interface BrowserSessionRecord {
   lastUsedAt: number;
 }
 
-export interface BrowserSessionRequest {
-  agentId: string;
-  browserMode?: BrowserMode;
-  targetId?: string;
-}
+export interface BrowserSessionRequest extends BrowserAccessRequest {}
 
 export interface BrowserSessionResponse {
   agentId: string;
   browserMode: BrowserMode;
+  stateMode: BrowserStateMode;
+  profileId?: string;
+  profileScope?: ProfileStorageScope;
+  workspacePath?: string;
   browserInstanceId: string;
   cdpUrl: string;
   targetId: string;
   createdAt: number;
   lastUsedAt: number;
+}
+
+export interface ProfileCreateRequest {
+  profileId: string;
+  scope?: ProfileStorageScope;
+  workspacePath?: string;
+  displayName?: string;
+}
+
+export interface ProfileMigrationRequest {
+  targetProfileId?: string;
+  targetScope: ProfileStorageScope;
+  targetWorkspacePath?: string;
+  mode?: ProfileMigrationMode;
+  force?: boolean;
+}
+
+export interface ProfileResponse {
+  profile: ProfileRecord;
+}
+
+export interface ProfileListResponse {
+  profiles: ProfileRecord[];
 }
