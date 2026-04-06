@@ -224,6 +224,10 @@ const browserAccessProperties = {
     type: 'string',
     description: 'Optional explicit identifier for reusing a fresh instance within a task',
   },
+  frameIndex: {
+    type: 'number',
+    description: 'Optional iframe index to operate within when the frame is same-origin',
+  },
 };
 
 const TOOLS = [
@@ -264,6 +268,10 @@ const TOOLS = [
         waitForLoad: {
           type: 'boolean',
           description: 'Wait for page load completion (default: true)',
+        },
+        timeoutMs: {
+          type: 'number',
+          description: 'Navigation timeout in milliseconds (default: 15000)',
         },
       },
       required: ['url'],
@@ -387,6 +395,16 @@ const TOOLS = [
     },
   },
   {
+    name: 'browser_frames',
+    description: 'List iframe/frame metadata visible from the current page',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...browserAccessProperties,
+      },
+    },
+  },
+  {
     name: 'browser_wait',
     description: 'Wait for an element to appear or a condition to be met',
     inputSchema: {
@@ -403,6 +421,15 @@ const TOOLS = [
         timeoutMs: {
           type: 'number',
           description: 'Maximum wait time in milliseconds (default: 30000)',
+        },
+        mode: {
+          type: 'string',
+          enum: ['selector', 'condition', 'content-stable'],
+          description: 'Wait strategy (default: selector or condition based on provided args)',
+        },
+        stableMs: {
+          type: 'number',
+          description: 'Required stability window in milliseconds for content-stable mode (default: 600)',
         },
         ...browserAccessProperties,
       },
@@ -555,13 +582,66 @@ function buildStartNavigateExpression(url) {
   `;
 }
 
-function buildPageStateExpression() {
+function buildFrameScopePrelude(frameIndex) {
+  if (frameIndex === undefined || frameIndex === null) {
+    return '';
+  }
+
   return `
-    ({
-      url: window.location.href,
-      title: document.title,
-      readyState: document.readyState
-    })
+    const __frameIndex = ${Number(frameIndex)};
+    const __frameElement = document.querySelectorAll('iframe')[__frameIndex];
+    if (!__frameElement) {
+      throw new Error('Iframe not found at frameIndex=' + __frameIndex);
+    }
+    const __frameWindow = __frameElement.contentWindow;
+    const __frameDocument = __frameWindow?.document;
+    if (!__frameWindow || !__frameDocument) {
+      throw new Error('Iframe at frameIndex=' + __frameIndex + ' is not accessible (likely cross-origin or not loaded)');
+    }
+  `;
+}
+
+function buildDocumentAccessor(frameIndex) {
+  return frameIndex === undefined || frameIndex === null ? 'document' : '__frameDocument';
+}
+
+function buildWindowAccessor(frameIndex) {
+  return frameIndex === undefined || frameIndex === null ? 'window' : '__frameWindow';
+}
+
+function buildLocationAccessor(frameIndex) {
+  return frameIndex === undefined || frameIndex === null ? 'window.location' : '__frameWindow.location';
+}
+
+function buildPageStateExpression(frameIndex) {
+  const prelude = buildFrameScopePrelude(frameIndex);
+  const doc = buildDocumentAccessor(frameIndex);
+  const win = buildWindowAccessor(frameIndex);
+  const locationRef = buildLocationAccessor(frameIndex);
+  return `
+    (() => {
+      ${prelude}
+      const body = ${doc}.body;
+      const mainLike = ${doc}.querySelector('main, #main, [role="main"], [data-testid="main"]');
+      const navEntry = ${win}.performance.getEntriesByType('navigation')[0];
+      return {
+        url: ${locationRef}.href,
+        title: ${doc}.title,
+        readyState: ${doc}.readyState,
+        bodyTextLength: (body?.innerText || '').trim().length,
+        domNodeCount: body ? body.querySelectorAll('*').length : 0,
+        mainLikeSelectorFound: Boolean(mainLike),
+        iframeCount: ${doc}.querySelectorAll('iframe').length,
+        frameIndex: ${frameIndex === undefined || frameIndex === null ? 'null' : Number(frameIndex)},
+        navigationTiming: navEntry
+          ? {
+              type: navEntry.type,
+              domContentLoaded: navEntry.domContentLoadedEventEnd,
+              loadEventEnd: navEntry.loadEventEnd,
+            }
+          : null,
+      };
+    })()
   `;
 }
 
@@ -617,33 +697,39 @@ function isTransientEvaluationError(error) {
   ].some((pattern) => message.includes(pattern));
 }
 
-function buildClickExpression(selector) {
+function buildClickExpression(selector, frameIndex) {
   const serializedSelector = literal(selector);
+  const prelude = buildFrameScopePrelude(frameIndex);
+  const doc = buildDocumentAccessor(frameIndex);
   return `
     (() => {
-      const element = document.querySelector(${serializedSelector});
+      ${prelude}
+      const element = ${doc}.querySelector(${serializedSelector});
       if (!element) {
         throw new Error('Element not found for selector: ' + ${serializedSelector});
       }
       element.click();
-      return { clicked: true, selector: ${serializedSelector} };
+      return { clicked: true, selector: ${serializedSelector}, frameIndex: ${frameIndex === undefined || frameIndex === null ? 'null' : Number(frameIndex)} };
     })()
   `;
 }
 
-function buildFillExpression(selector, value) {
+function buildFillExpression(selector, value, frameIndex) {
   const serializedSelector = literal(selector);
   const serializedValue = literal(value);
+  const prelude = buildFrameScopePrelude(frameIndex);
+  const doc = buildDocumentAccessor(frameIndex);
   return `
     (() => {
-      const element = document.querySelector(${serializedSelector});
+      ${prelude}
+      const element = ${doc}.querySelector(${serializedSelector});
       if (!element) {
         throw new Error('Element not found for selector: ' + ${serializedSelector});
       }
       element.value = ${serializedValue};
       element.dispatchEvent(new Event('input', { bubbles: true }));
       element.dispatchEvent(new Event('change', { bubbles: true }));
-      return { selector: ${serializedSelector}, value: element.value };
+      return { selector: ${serializedSelector}, value: element.value, frameIndex: ${frameIndex === undefined || frameIndex === null ? 'null' : Number(frameIndex)} };
     })()
   `;
 }
@@ -655,16 +741,20 @@ function buildOutlineExpression(options = {}) {
   const maxDepth = options.outlineDepth || 4;
   const maxChildren = 15;
   const maxClassesShown = 3;
+  const prelude = buildFrameScopePrelude(options.frameIndex);
+  const doc = buildDocumentAccessor(options.frameIndex);
+  const locationRef = buildLocationAccessor(options.frameIndex);
 
   return `
     (() => {
+      ${prelude}
       const maxDepth = ${maxDepth};
       const maxChildren = ${maxChildren};
       const maxClassesShown = ${maxClassesShown};
 
       function estimateTokens(text) {
         if (!text) return 0;
-        const cjk = (text.match(/[\\u4e00-\\u9fff\\u3040-\\u309f\\u30a0-\\u30ff\\uac00-\\ud7af]/g) || []).length;
+        const cjk = (text.match(/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/g) || []).length;
         const other = text.length - cjk;
         return Math.ceil(cjk / 1.5 + other / 4);
       }
@@ -697,7 +787,6 @@ function buildOutlineExpression(options = {}) {
 
         const tag = node.tagName.toLowerCase();
 
-        // Skip script, style, noscript, template
         if (['script', 'style', 'noscript', 'template', 'svg'].includes(tag)) {
           return { tag, skipped: true };
         }
@@ -707,9 +796,7 @@ function buildOutlineExpression(options = {}) {
         const tokens = estimateTokens(text);
         const childCount = node.children.length;
 
-        const result = {
-          tag,
-        };
+        const result = { tag };
 
         if (node.id) result.id = node.id;
 
@@ -724,7 +811,6 @@ function buildOutlineExpression(options = {}) {
 
         result.stats = { textLen, tokens, children: childCount };
 
-        // Recurse into children
         if (depth < maxDepth && childCount > 0) {
           const childOutlines = [];
           const visibleChildren = [...node.children].filter(c => {
@@ -751,22 +837,19 @@ function buildOutlineExpression(options = {}) {
         return result;
       }
 
-      const body = document.body;
+      const body = ${doc}.body;
       const outline = outlineNode(body, 0);
-
-      // Calculate page-level stats
       const allText = body.innerText || '';
       const totalElements = body.querySelectorAll('*').length;
       const totalTokens = estimateTokens(allText);
-
-      // Estimate line count if content were formatted
       const htmlLen = body.outerHTML.length;
       const estimatedLines = Math.ceil(htmlLen / 80);
 
       return {
-        url: location.href,
-        title: document.title,
-        readyState: document.readyState,
+        url: ${locationRef}.href,
+        title: ${doc}.title,
+        readyState: ${doc}.readyState,
+        frameIndex: ${options.frameIndex === undefined || options.frameIndex === null ? 'null' : Number(options.frameIndex)},
         outline,
         pageStats: {
           totalElements,
@@ -792,9 +875,13 @@ function buildContentExpression(options = {}) {
   const includeHidden = options.includeHidden || false;
   const includeSvg = options.includeSvg || false;
   const includeHead = options.includeHead || false;
+  const prelude = buildFrameScopePrelude(options.frameIndex);
+  const doc = buildDocumentAccessor(options.frameIndex);
+  const locationRef = buildLocationAccessor(options.frameIndex);
 
   return `
     (() => {
+      ${prelude}
       const selector = ${literal(selector)};
       const includeScripts = ${includeScripts};
       const includeStyles = ${includeStyles};
@@ -802,54 +889,45 @@ function buildContentExpression(options = {}) {
       const includeSvg = ${includeSvg};
       const includeHead = ${includeHead};
 
-      const targetEl = document.querySelector(selector);
+      const targetEl = ${doc}.querySelector(selector);
       if (!targetEl) {
         throw new Error('Selector not found: ' + selector);
       }
 
-      // Clone to avoid mutating the actual DOM
       const clone = targetEl.cloneNode(true);
 
-      // Remove scripts
       if (!includeScripts) {
         clone.querySelectorAll('script, noscript').forEach(el => el.remove());
       }
 
-      // Remove styles
       if (!includeStyles) {
         clone.querySelectorAll('style, link[rel="stylesheet"]').forEach(el => el.remove());
         clone.querySelectorAll('[style]').forEach(el => el.removeAttribute('style'));
       }
 
-      // Remove hidden elements
       if (!includeHidden) {
         clone.querySelectorAll('[hidden], [aria-hidden="true"]').forEach(el => el.remove());
       }
 
-      // Replace SVG with placeholder
       if (!includeSvg) {
         clone.querySelectorAll('svg').forEach(svg => {
-          const span = document.createElement('span');
+          const span = ${doc}.createElement('span');
           span.textContent = '[SVG]';
           svg.replaceWith(span);
         });
       }
 
-      // Remove common noise attributes
       clone.querySelectorAll('*').forEach(el => {
-        // Remove data-* attributes except useful ones
         [...el.attributes]
           .filter(a => a.name.startsWith('data-') &&
             !['data-id', 'data-testid', 'data-name', 'data-value'].includes(a.name))
           .forEach(a => el.removeAttribute(a.name));
 
-        // Remove tracking/analytics attributes
         ['onclick', 'onload', 'onerror', 'onmouseover'].forEach(attr => {
           el.removeAttribute(attr);
         });
       });
 
-      // Simple HTML formatting
       function formatHtml(html) {
         let formatted = '';
         let indent = 0;
@@ -862,14 +940,12 @@ function buildContentExpression(options = {}) {
           const trimmed = line.trim();
           if (!trimmed) continue;
 
-          // Decrease indent for closing tags
           if (trimmed.startsWith('</')) {
             indent = Math.max(0, indent - 1);
           }
 
           formatted += '  '.repeat(indent) + trimmed + '\\n';
 
-          // Increase indent for opening tags (not self-closing, not closing)
           if (trimmed.startsWith('<') &&
               !trimmed.startsWith('</') &&
               !trimmed.endsWith('/>') &&
@@ -883,16 +959,15 @@ function buildContentExpression(options = {}) {
       const rawHtml = clone.outerHTML;
       const formattedHtml = formatHtml(rawHtml);
       const lines = formattedHtml.split('\\n').filter(l => l.trim());
-
-      // Estimate tokens
       const text = clone.innerText || '';
-      const cjk = (text.match(/[\\u4e00-\\u9fff]/g) || []).length;
+      const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
       const tokens = Math.ceil(cjk / 1.5 + (text.length - cjk) / 4);
 
       return {
-        url: location.href,
-        title: document.title,
+        url: ${locationRef}.href,
+        title: ${doc}.title,
         selector,
+        frameIndex: ${options.frameIndex === undefined || options.frameIndex === null ? 'null' : Number(options.frameIndex)},
         lines,
         totalLines: lines.length,
         estimatedTokens: tokens
@@ -935,53 +1010,139 @@ function applyWindowing(lines, offset = 0, limit = 150) {
   };
 }
 
-function buildExtractExpression(selectors) {
+function buildExtractExpression(selectors, frameIndex) {
+  const prelude = buildFrameScopePrelude(frameIndex);
+  const doc = buildDocumentAccessor(frameIndex);
   const fields = Object.entries(selectors || {}).map(([key, selector]) => {
-    return `${JSON.stringify(key)}: document.querySelector(${literal(selector)})?.textContent?.trim() || null`;
+    return `${JSON.stringify(key)}: ${doc}.querySelector(${literal(selector)})?.textContent?.trim() || null`;
   });
 
-  return `({
-    ${fields.join(',\n    ')}
-  })`;
+  return `(() => {
+    ${prelude}
+    return {
+      ${fields.join(',\n      ')},
+      frameIndex: ${frameIndex === undefined || frameIndex === null ? 'null' : Number(frameIndex)}
+    };
+  })()`;
+}
+
+function buildListFramesExpression() {
+  return `
+    (() => ({
+      url: window.location.href,
+      title: document.title,
+      frames: Array.from(document.querySelectorAll('iframe')).map((frame, index) => {
+        const sameOriginAccessible = (() => {
+          try {
+            return Boolean(frame.contentWindow?.document);
+          } catch {
+            return false;
+          }
+        })();
+        return {
+          index,
+          id: frame.id || null,
+          name: frame.getAttribute('name') || null,
+          title: frame.getAttribute('title') || null,
+          src: frame.getAttribute('src') || null,
+          loading: frame.getAttribute('loading') || null,
+          visible: !!(frame.offsetWidth || frame.offsetHeight || frame.getClientRects().length),
+          sameOriginAccessible,
+        };
+      })
+    }))()
+  `;
 }
 
 function buildWaitExpression(args) {
   const timeoutMs = args.timeoutMs || 30000;
+  const mode = args.mode || (args.selector ? 'selector' : args.condition ? 'condition' : null);
+  const prelude = buildFrameScopePrelude(args.frameIndex);
+  const doc = buildDocumentAccessor(args.frameIndex);
+  const win = buildWindowAccessor(args.frameIndex);
 
-  if (args.selector) {
+  if (mode === 'content-stable') {
+    const stableMs = args.stableMs || 600;
+    return `
+      (() => new Promise((resolve, reject) => {
+        ${prelude}
+        const timeout = setTimeout(() => reject(new Error('Timeout waiting for stable content')), ${timeoutMs});
+        let stableSince = null;
+        let previous = null;
+        const sample = () => ({
+          url: ${win}.location.href,
+          readyState: ${doc}.readyState,
+          textLength: (${doc}.body?.innerText || '').trim().length,
+          nodeCount: ${doc}.body ? ${doc}.body.querySelectorAll('*').length : 0,
+          mainLike: !!${doc}.querySelector('main, #main, [role="main"], [data-testid="main"]')
+        });
+        const isStable = (current, last) => {
+          if (!last) return false;
+          const textDelta = Math.abs(current.textLength - last.textLength);
+          const nodeDelta = Math.abs(current.nodeCount - last.nodeCount);
+          return current.url === last.url &&
+            current.readyState !== 'loading' &&
+            current.textLength >= 200 &&
+            (current.mainLike || current.nodeCount >= 25) &&
+            textDelta <= 20 &&
+            nodeDelta <= 5;
+        };
+        const check = () => {
+          const current = sample();
+          if (isStable(current, previous)) {
+            if (!stableSince) {
+              stableSince = Date.now();
+            }
+            if (Date.now() - stableSince >= ${stableMs}) {
+              clearTimeout(timeout);
+              resolve({ mode: 'content-stable', met: true, frameIndex: ${args.frameIndex === undefined || args.frameIndex === null ? 'null' : Number(args.frameIndex)}, sample: current });
+              return;
+            }
+          } else {
+            stableSince = null;
+          }
+          previous = current;
+          setTimeout(check, 150);
+        };
+        check();
+      }))()
+    `;
+  }
+
+  if (mode === 'selector') {
     const serializedSelector = literal(args.selector);
     return `
-      await new Promise((resolve, reject) => {
+      (() => new Promise((resolve, reject) => {
+        ${prelude}
         const timeout = setTimeout(() => reject(new Error('Timeout waiting for selector')), ${timeoutMs});
         const check = () => {
-          if (document.querySelector(${serializedSelector})) {
+          if (${doc}.querySelector(${serializedSelector})) {
             clearTimeout(timeout);
-            resolve();
+            resolve({ selector: ${serializedSelector}, met: true, frameIndex: ${args.frameIndex === undefined || args.frameIndex === null ? 'null' : Number(args.frameIndex)} });
           } else {
             setTimeout(check, 100);
           }
         };
         check();
-      });
-      ({ selector: ${serializedSelector}, met: true });
+      }))()
     `;
   }
 
-  if (args.condition) {
+  if (mode === 'condition') {
     return `
-      await new Promise((resolve, reject) => {
+      (() => new Promise((resolve, reject) => {
+        ${prelude}
         const timeout = setTimeout(() => reject(new Error('Timeout waiting for condition')), ${timeoutMs});
         const check = () => {
           if (${args.condition}) {
             clearTimeout(timeout);
-            resolve();
+            resolve({ conditionMet: true, frameIndex: ${args.frameIndex === undefined || args.frameIndex === null ? 'null' : Number(args.frameIndex)} });
           } else {
             setTimeout(check, 100);
           }
         };
         check();
-      });
-      ({ conditionMet: true });
+      }))()
     `;
   }
 
@@ -1003,10 +1164,50 @@ async function evaluateWithBrowserMode(args, expression, timeoutMs, extra = {}) 
   });
 }
 
+function isUsableNavigationState(state, requestedUrl) {
+  if (!state || typeof state.url !== 'string' || !urlMatchesTarget(state.url, requestedUrl)) {
+    return false;
+  }
+
+  if (state.readyState === 'complete') {
+    return true;
+  }
+
+  if (state.readyState !== 'interactive') {
+    return false;
+  }
+
+  const hasContent = Number(state.bodyTextLength || 0) >= 200;
+  const hasStructure = Boolean(state.mainLikeSelectorFound) || Number(state.domNodeCount || 0) >= 25;
+  const hasTitle = typeof state.title === 'string' && state.title.trim().length > 0;
+  const hasDomReady = Boolean(state.navigationTiming && state.navigationTiming.domContentLoaded > 0);
+
+  return hasTitle && hasDomReady && (hasContent || hasStructure);
+}
+
+function summarizeNavigationState(state) {
+  if (!state) {
+    return '';
+  }
+
+  return JSON.stringify({
+    url: state.url,
+    title: state.title,
+    readyState: state.readyState,
+    bodyTextLength: state.bodyTextLength,
+    domNodeCount: state.domNodeCount,
+    mainLikeSelectorFound: state.mainLikeSelectorFound,
+    iframeCount: state.iframeCount,
+    navigationTiming: state.navigationTiming,
+  });
+}
+
 async function waitForNavigationResult(args, requestedUrl, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let lastState;
   let transientFailures = 0;
+  let usableStateSince = null;
+  const usabilityStabilityMs = 600;
 
   while (Date.now() < deadline) {
     try {
@@ -1020,13 +1221,18 @@ async function waitForNavigationResult(args, requestedUrl, timeoutMs) {
       );
       lastState = snapshot.result;
 
-      if (
-        lastState &&
-        typeof lastState.url === 'string' &&
-        urlMatchesTarget(lastState.url, requestedUrl) &&
-        lastState.readyState === 'complete'
-      ) {
-        return lastState;
+      if (isUsableNavigationState(lastState, requestedUrl)) {
+        if (lastState.readyState === 'complete') {
+          return lastState;
+        }
+
+        if (!usableStateSince) {
+          usableStateSince = Date.now();
+        } else if (Date.now() - usableStateSince >= usabilityStabilityMs) {
+          return lastState;
+        }
+      } else {
+        usableStateSince = null;
       }
     } catch (error) {
       if (!isTransientEvaluationError(error)) {
@@ -1038,16 +1244,16 @@ async function waitForNavigationResult(args, requestedUrl, timeoutMs) {
     await sleep(250);
   }
 
-  const details = lastState ? ` Last state: ${JSON.stringify(lastState)}` : '';
+  const details = lastState ? ` Last state: ${summarizeNavigationState(lastState)}` : '';
   const transientNote = transientFailures > 0 ? ` Transient errors: ${transientFailures}.` : '';
   throw new Error(`Navigation timeout waiting for ${requestedUrl}.${transientNote}${details}`);
 }
 
 async function navigateWithBrowserMode(args) {
   const requestedUrl = String(args.url);
-  const timeoutMs = 10000;
+  const timeoutMs = Math.max(10000, Number(args.timeoutMs) || 15000);
 
-  await evaluateWithBrowserMode(args, buildStartNavigateExpression(requestedUrl), timeoutMs, {
+  await evaluateWithBrowserMode(args, buildStartNavigateExpression(requestedUrl), Math.min(timeoutMs, 10000), {
     awaitPromise: false,
   });
 
@@ -1065,13 +1271,10 @@ async function handleBrowserSnapshot(args) {
   const wantsContent = args.expandSelector || args.fullContent;
 
   if (!wantsContent) {
-    // Return outline (safe default)
     const result = await evaluateWithBrowserMode(args, buildOutlineExpression(args), 15000);
-
     const response = result.result;
 
-    // Add cookies if requested
-    if (args.includeCookies) {
+    if (args.includeCookies && (args.frameIndex === undefined || args.frameIndex === null)) {
       const cookieResult = await evaluateWithBrowserMode(args, 'document.cookie', 5000);
       response.cookies = cookieResult.result;
     }
@@ -1079,7 +1282,6 @@ async function handleBrowserSnapshot(args) {
     return response;
   }
 
-  // Content mode: extract, clean, and window
   const contentOpts = {
     expandSelector: args.expandSelector || 'body',
     includeScripts: args.includeScripts,
@@ -1087,13 +1289,12 @@ async function handleBrowserSnapshot(args) {
     includeHidden: args.includeHidden,
     includeSvg: args.includeSvg,
     includeHead: args.includeHead,
+    frameIndex: args.frameIndex,
   };
 
   const result = await evaluateWithBrowserMode(args, buildContentExpression(contentOpts), 20000);
+  const { lines, totalLines, estimatedTokens, url, title, selector, frameIndex } = result.result;
 
-  const { lines, totalLines, estimatedTokens, url, title, selector } = result.result;
-
-  // Apply windowing
   const offset = args.offset || 0;
   const limit = args.limit || 150;
   const windowed = applyWindowing(lines, offset, limit);
@@ -1102,6 +1303,7 @@ async function handleBrowserSnapshot(args) {
     url,
     title,
     selector,
+    frameIndex,
     content: windowed.content,
     window: windowed.window,
     contentStats: {
@@ -1112,8 +1314,7 @@ async function handleBrowserSnapshot(args) {
     },
   };
 
-  // Add cookies if requested
-  if (args.includeCookies) {
+  if (args.includeCookies && (args.frameIndex === undefined || args.frameIndex === null)) {
     const cookieResult = await evaluateWithBrowserMode(args, 'document.cookie', 5000);
     response.cookies = cookieResult.result;
   }
@@ -1127,6 +1328,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'browser_evaluate': {
+        const expression = args.frameIndex === undefined || args.frameIndex === null
+          ? args.expression
+          : `(() => { ${buildFrameScopePrelude(args.frameIndex)} return (() => { const document = __frameDocument; const window = __frameWindow; return (${args.expression}); })(); })()`;
         const evalResult = await cdpClient.evaluate({
           agentId: args.agentId,
           browserMode: args.browserMode,
@@ -1135,7 +1339,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           profileScope: args.profileScope,
           workspacePath: args.workspacePath,
           freshInstanceId: args.freshInstanceId,
-          expression: args.expression,
+          expression,
           awaitPromise: args.awaitPromise,
           budget: { timeoutMs: args.timeoutMs },
         });
@@ -1162,14 +1366,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_click': {
-        await evaluateWithBrowserMode(args, buildClickExpression(args.selector), 10000);
+        await evaluateWithBrowserMode(args, buildClickExpression(args.selector, args.frameIndex), 10000);
         return {
           content: [{ type: 'text', text: `Clicked element: ${args.selector}` }],
         };
       }
 
       case 'browser_fill': {
-        await evaluateWithBrowserMode(args, buildFillExpression(args.selector, args.value), 10000);
+        await evaluateWithBrowserMode(args, buildFillExpression(args.selector, args.value, args.frameIndex), 10000);
         return {
           content: [{ type: 'text', text: `Filled ${args.selector} with ${JSON.stringify(args.value)}` }],
         };
@@ -1190,7 +1394,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'browser_extract': {
         const extracted = await evaluateWithBrowserMode(
           args,
-          buildExtractExpression(args.selectors),
+          buildExtractExpression(args.selectors, args.frameIndex),
           10000
         );
         return {
@@ -1198,6 +1402,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: JSON.stringify(extracted.result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'browser_frames': {
+        const frames = await evaluateWithBrowserMode(args, buildListFramesExpression(), 10000);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(frames.result, null, 2),
             },
           ],
         };
