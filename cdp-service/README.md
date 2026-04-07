@@ -94,6 +94,15 @@ curl http://localhost:3100/health
 - `browser.dedicated.headless` 控制 dedicated 实例是否无头运行
 - 默认配置现在是 `headless: false`，也就是有头模式，便于观察执行过程并降低部分站点对无头浏览器的风控命中率
 - 如需恢复无头模式，把 `config.yaml` 或 `config-optimized.yaml` 中的 `browser.dedicated.headless` 改为 `true`
+- `browser_navigate` 现在使用显式 `/api/v1/navigate`，并可对受保护社媒站点启用默认安全限流
+
+#### 社媒导航安全限流
+- 默认受保护站点：`linkedin.com`、`instagram.com`、`x.com` / `twitter.com`、`facebook.com`
+- 仅对 `browser_navigate` / `/api/v1/navigate` 生效，不影响 `browser_evaluate` 中手写导航
+- 同站点跨 agent 共享一个 FIFO 队列
+- 相邻两次新 URL 启动至少间隔 `5s`
+- 每次真正开始导航前额外增加 `0~3000ms` 随机延迟
+- 可通过 `browser.navigationSafety` 配置关闭或调节策略
 
 ## 核心功能
 
@@ -225,6 +234,17 @@ browser:
     createUrl: about:blank
     enforceOwnership: true
     allowClientTargetOverride: false
+  navigationSafety:
+    enabled: true
+    protectedSites:
+      - linkedin.com
+      - instagram.com
+      - x.com
+      - twitter.com
+      - facebook.com
+    minStartIntervalMs: 5000
+    maxRandomStartupDelayMs: 3000
+    queueDiscipline: fifo
   cleanupIntervalMs: 30000
 
 isolation:
@@ -279,6 +299,17 @@ browser:
     createUrl: about:blank
     enforceOwnership: true
     allowClientTargetOverride: false
+  navigationSafety:
+    enabled: true
+    protectedSites:
+      - linkedin.com
+      - instagram.com
+      - x.com
+      - twitter.com
+      - facebook.com
+    minStartIntervalMs: 5000
+    maxRandomStartupDelayMs: 3000
+    queueDiscipline: fifo
   cleanupIntervalMs: 30000
 
 isolation:
@@ -377,6 +408,46 @@ const result = await client.evaluate({
     "durationMs": "number",
     "isolationLevel": "process|context|session",
     "engineId": "string"
+  }
+}
+```
+
+### POST /api/v1/navigate
+
+执行显式页面导航。需要认证。
+
+**请求**：
+```json
+{
+  "agentId": "string (可选)",
+  "url": "string (必需，绝对 URL)",
+  "browserMode": "shared|dedicated (可选)",
+  "stateMode": "profile|fresh (可选)",
+  "profileId": "string (可选)",
+  "profileScope": "workspace|global (可选)",
+  "workspacePath": "string (workspace profile 时必需)",
+  "freshInstanceId": "string (可选)",
+  "waitForLoad": "boolean (可选)",
+  "timeoutMs": "number (可选)"
+}
+```
+
+**响应**：
+```json
+{
+  "url": "https://www.linkedin.com/feed/",
+  "title": "Feed | LinkedIn",
+  "readyState": "interactive",
+  "metadata": {
+    "browserMode": "dedicated",
+    "stateMode": "profile",
+    "browserInstanceId": "browser-123",
+    "targetId": "target-123",
+    "rateLimitApplied": true,
+    "siteBucket": "linkedin",
+    "queueWaitMs": 5032,
+    "startupDelayMs": 1844,
+    "startedAt": 1710000000000
   }
 }
 ```

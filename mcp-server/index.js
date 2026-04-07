@@ -49,6 +49,35 @@ class CdpServiceClient {
     return response.json();
   }
 
+  async navigate(params) {
+    const response = await fetch(`${this.serviceUrl}/api/v1/navigate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.authToken}`,
+      },
+      body: JSON.stringify({
+        agentId: params.agentId || 'mcp-agent',
+        browserMode: params.browserMode,
+        stateMode: params.stateMode,
+        profileId: params.profileId,
+        profileScope: params.profileScope,
+        workspacePath: params.workspacePath,
+        freshInstanceId: params.freshInstanceId,
+        url: params.url,
+        waitForLoad: params.waitForLoad,
+        timeoutMs: params.timeoutMs || this.defaultTimeout,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+      throw new Error(`CDP Service error: ${error.message || error.error || response.statusText}`);
+    }
+
+    return response.json();
+  }
+
   async getHealth() {
     const response = await fetch(`${this.serviceUrl}/health`);
     return response.json();
@@ -565,23 +594,6 @@ function literal(value) {
   return JSON.stringify(String(value));
 }
 
-function buildStartNavigateExpression(url) {
-  const serializedUrl = literal(url);
-  return `
-    (() => {
-      const nextUrl = ${serializedUrl};
-      window.setTimeout(() => {
-        window.location.href = nextUrl;
-      }, 0);
-      return {
-        scheduled: true,
-        requestedUrl: nextUrl,
-        previousUrl: window.location.href
-      };
-    })()
-  `;
-}
-
 function buildFrameScopePrelude(frameIndex) {
   if (frameIndex === undefined || frameIndex === null) {
     return '';
@@ -613,88 +625,8 @@ function buildLocationAccessor(frameIndex) {
   return frameIndex === undefined || frameIndex === null ? 'window.location' : '__frameWindow.location';
 }
 
-function buildPageStateExpression(frameIndex) {
-  const prelude = buildFrameScopePrelude(frameIndex);
-  const doc = buildDocumentAccessor(frameIndex);
-  const win = buildWindowAccessor(frameIndex);
-  const locationRef = buildLocationAccessor(frameIndex);
-  return `
-    (() => {
-      ${prelude}
-      const body = ${doc}.body;
-      const mainLike = ${doc}.querySelector('main, #main, [role="main"], [data-testid="main"]');
-      const navEntry = ${win}.performance.getEntriesByType('navigation')[0];
-      return {
-        url: ${locationRef}.href,
-        title: ${doc}.title,
-        readyState: ${doc}.readyState,
-        bodyTextLength: (body?.innerText || '').trim().length,
-        domNodeCount: body ? body.querySelectorAll('*').length : 0,
-        mainLikeSelectorFound: Boolean(mainLike),
-        iframeCount: ${doc}.querySelectorAll('iframe').length,
-        frameIndex: ${frameIndex === undefined || frameIndex === null ? 'null' : Number(frameIndex)},
-        navigationTiming: navEntry
-          ? {
-              type: navEntry.type,
-              domContentLoaded: navEntry.domContentLoadedEventEnd,
-              loadEventEnd: navEntry.loadEventEnd,
-            }
-          : null,
-      };
-    })()
-  `;
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeComparablePath(pathname) {
-  if (!pathname || pathname === '/') {
-    return '/';
-  }
-
-  return pathname.endsWith('/') ? pathname.slice(0, -1) || '/' : pathname;
-}
-
-function urlMatchesTarget(currentUrl, requestedUrl) {
-  if (currentUrl === requestedUrl || currentUrl.startsWith(requestedUrl)) {
-    return true;
-  }
-
-  try {
-    const current = new URL(currentUrl);
-    const requested = new URL(requestedUrl);
-
-    if (current.origin !== requested.origin) {
-      return false;
-    }
-
-    const currentPath = normalizeComparablePath(current.pathname);
-    const requestedPath = normalizeComparablePath(requested.pathname);
-
-    if (requestedPath === '/') {
-      return true;
-    }
-
-    return currentPath === requestedPath;
-  } catch {
-    return currentUrl === requestedUrl;
-  }
-}
-
-function isTransientEvaluationError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return [
-    'Execution context was destroyed',
-    'Cannot find context with specified id',
-    'Inspected target navigated or closed',
-    'No frame with given id',
-    'Target closed',
-    'Session closed',
-    'CDP Service error: Uncaught',
-    'Error: Uncaught',
-  ].some((pattern) => message.includes(pattern));
 }
 
 function buildClickExpression(selector, frameIndex) {
@@ -1164,109 +1096,6 @@ async function evaluateWithBrowserMode(args, expression, timeoutMs, extra = {}) 
   });
 }
 
-function isUsableNavigationState(state, requestedUrl) {
-  if (!state || typeof state.url !== 'string' || !urlMatchesTarget(state.url, requestedUrl)) {
-    return false;
-  }
-
-  if (state.readyState === 'complete') {
-    return true;
-  }
-
-  if (state.readyState !== 'interactive') {
-    return false;
-  }
-
-  const hasContent = Number(state.bodyTextLength || 0) >= 200;
-  const hasStructure = Boolean(state.mainLikeSelectorFound) || Number(state.domNodeCount || 0) >= 25;
-  const hasTitle = typeof state.title === 'string' && state.title.trim().length > 0;
-  const hasDomReady = Boolean(state.navigationTiming && state.navigationTiming.domContentLoaded > 0);
-
-  return hasTitle && hasDomReady && (hasContent || hasStructure);
-}
-
-function summarizeNavigationState(state) {
-  if (!state) {
-    return '';
-  }
-
-  return JSON.stringify({
-    url: state.url,
-    title: state.title,
-    readyState: state.readyState,
-    bodyTextLength: state.bodyTextLength,
-    domNodeCount: state.domNodeCount,
-    mainLikeSelectorFound: state.mainLikeSelectorFound,
-    iframeCount: state.iframeCount,
-    navigationTiming: state.navigationTiming,
-  });
-}
-
-async function waitForNavigationResult(args, requestedUrl, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let lastState;
-  let transientFailures = 0;
-  let usableStateSince = null;
-  const usabilityStabilityMs = 600;
-
-  while (Date.now() < deadline) {
-    try {
-      const snapshot = await evaluateWithBrowserMode(
-        args,
-        buildPageStateExpression(),
-        Math.max(1000, Math.min(5000, deadline - Date.now())),
-        {
-          awaitPromise: false,
-        }
-      );
-      lastState = snapshot.result;
-
-      if (isUsableNavigationState(lastState, requestedUrl)) {
-        if (lastState.readyState === 'complete') {
-          return lastState;
-        }
-
-        if (!usableStateSince) {
-          usableStateSince = Date.now();
-        } else if (Date.now() - usableStateSince >= usabilityStabilityMs) {
-          return lastState;
-        }
-      } else {
-        usableStateSince = null;
-      }
-    } catch (error) {
-      if (!isTransientEvaluationError(error)) {
-        throw error;
-      }
-      transientFailures += 1;
-    }
-
-    await sleep(250);
-  }
-
-  const details = lastState ? ` Last state: ${summarizeNavigationState(lastState)}` : '';
-  const transientNote = transientFailures > 0 ? ` Transient errors: ${transientFailures}.` : '';
-  throw new Error(`Navigation timeout waiting for ${requestedUrl}.${transientNote}${details}`);
-}
-
-async function navigateWithBrowserMode(args) {
-  const requestedUrl = String(args.url);
-  const timeoutMs = Math.max(10000, Number(args.timeoutMs) || 15000);
-
-  await evaluateWithBrowserMode(args, buildStartNavigateExpression(requestedUrl), Math.min(timeoutMs, 10000), {
-    awaitPromise: false,
-  });
-
-  if (args.waitForLoad === false) {
-    return { url: requestedUrl };
-  }
-
-  return waitForNavigationResult(args, requestedUrl, timeoutMs);
-}
-
-/**
- * Handle browser_snapshot with outline-first approach and windowing
- */
 async function handleBrowserSnapshot(args) {
   const wantsContent = args.expandSelector || args.fullContent;
 
@@ -1354,12 +1183,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_navigate': {
-        const state = await navigateWithBrowserMode(args);
+        const state = await cdpClient.navigate(args);
         return {
           content: [
             {
               type: 'text',
-              text: `Navigated to ${state.url || args.url}`,
+              text: JSON.stringify(state, null, 2),
             },
           ],
         };

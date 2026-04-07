@@ -8,6 +8,8 @@ import type {
   HealthStatus,
   EvaluateRequest,
   EvaluateResponse,
+  NavigateRequest,
+  NavigateResponse,
   BrowserMode,
   BrowserSessionRequest,
   EngineEvaluateRequest,
@@ -15,6 +17,7 @@ import type {
   ProfileStorageScope,
   ProfileCreateRequest,
   ProfileMigrationRequest,
+  NavigationSafetySite,
 } from './types.js';
 import { getLogger } from './logger.js';
 import { IsolationRouter } from './isolation-router.js';
@@ -528,6 +531,168 @@ export class HttpServer {
       }
     });
 
+    this.app.post('/api/v1/navigate', async (req, res) => {
+      const budgetManager = getBudgetManager();
+      const queueManager = getQueueManager();
+
+      try {
+        const request = req.body as NavigateRequest;
+
+        if (!request.url) {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: 'url is required',
+          });
+          return;
+        }
+
+        let requestedUrl: URL;
+        try {
+          requestedUrl = new URL(request.url);
+        } catch {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: 'url must be a valid absolute URL',
+          });
+          return;
+        }
+
+        const agentId = request.agentId?.trim() || 'default';
+        const browserMode = this.normalizeBrowserMode(request.browserMode) || this.config.browser.defaultMode;
+        const stateMode = this.normalizeStateMode(request.stateMode) || undefined;
+        const profileScope = this.normalizeProfileScope(request.profileScope) || undefined;
+        const workspacePath = this.normalizeOptionalString(request.workspacePath);
+        const profileId = this.normalizeOptionalString(request.profileId);
+        const freshInstanceId = this.normalizeOptionalString(request.freshInstanceId);
+
+        if (request.browserMode && !this.normalizeBrowserMode(request.browserMode)) {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: 'browserMode must be shared or dedicated',
+          });
+          return;
+        }
+
+        const validationError = this.validateAccessRequest({
+          agentId,
+          browserMode,
+          stateMode,
+          profileId,
+          profileScope,
+          workspacePath,
+          freshInstanceId,
+        });
+        if (validationError) {
+          res.status(400).json({ error: 'Bad Request', message: validationError });
+          return;
+        }
+
+        const timeoutMs = request.timeoutMs || this.config.timeouts.defaultBudgetMs;
+        if (timeoutMs > this.config.timeouts.maxBudgetMs) {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: `Timeout exceeds maximum (${this.config.timeouts.maxBudgetMs}ms)`,
+          });
+          return;
+        }
+
+        const requestBudget = budgetManager.createBudget({ timeoutMs });
+
+        try {
+          const session = await this.browserSessionRegistry.resolveSession(
+            {
+              agentId,
+              browserMode,
+              stateMode,
+              profileId,
+              profileScope,
+              workspacePath,
+              freshInstanceId,
+            },
+            requestBudget
+          );
+
+          const siteBucket = this.getNavigationSafetySite(requestedUrl.hostname);
+          let rateLimitApplied = false;
+          let queueWaitMs = 0;
+          let startupDelayMs = 0;
+          let startedAt = Date.now();
+
+          if (siteBucket && this.isNavigationSafetyEnabledForHost(requestedUrl.hostname)) {
+            const permitBudget = budgetManager.propagateBudget(requestBudget, 100);
+            try {
+              const permit = await queueManager.acquireNavigationPermit(siteBucket, permitBudget, {
+                minStartIntervalMs: this.config.browser.navigationSafety.minStartIntervalMs,
+                maxRandomStartupDelayMs: this.config.browser.navigationSafety.maxRandomStartupDelayMs,
+              });
+              rateLimitApplied = true;
+              queueWaitMs = permit.queueWaitMs;
+              startupDelayMs = permit.startupDelayMs;
+              startedAt = permit.startedAt;
+            } finally {
+              permitBudget.cleanup();
+            }
+          }
+
+          const navigateBudget = budgetManager.propagateBudget(requestBudget, 50);
+          try {
+            const response = await queueManager.enqueue(
+              session.targetId,
+              () => this.navigateSessionToUrl(session.cdpUrl, session.targetId, request.url, navigateBudget),
+              navigateBudget
+            );
+
+            const payload: NavigateResponse = {
+              url: response.url,
+              title: response.title,
+              readyState: response.readyState,
+              metadata: {
+                browserMode: session.browserMode,
+                stateMode: session.stateMode,
+                browserInstanceId: session.browserInstanceId,
+                targetId: session.targetId,
+                rateLimitApplied,
+                siteBucket: siteBucket || undefined,
+                queueWaitMs,
+                startupDelayMs,
+                startedAt,
+              },
+            };
+
+            logger.info('Navigate request completed', {
+              agentId,
+              requestedUrl: request.url,
+              finalUrl: payload.url,
+              browserMode: session.browserMode,
+              stateMode: session.stateMode,
+              profileId: session.profileId,
+              browserInstanceId: session.browserInstanceId,
+              targetId: session.targetId,
+              rateLimitApplied,
+              siteBucket,
+              queueWaitMs,
+              startupDelayMs,
+            });
+
+            res.json(payload);
+          } finally {
+            navigateBudget.cleanup();
+          }
+        } finally {
+          requestBudget.cleanup();
+        }
+      } catch (error) {
+        logger.error('Navigate failed', error);
+        const message = error instanceof Error ? error.message : 'Unknown error';
+        const statusCode = this.isClientError(message) ? 400 : 500;
+
+        res.status(statusCode).json({
+          error: 'Navigation Failed',
+          message,
+        });
+      }
+    });
+
     // Error handling
     this.app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
       logger.error('Unhandled error', err);
@@ -646,6 +811,148 @@ export class HttpServer {
       return null;
     } catch (error) {
       return error instanceof Error ? error.message : 'Invalid browser access request';
+    }
+  }
+
+  private getNavigationSafetySite(hostname: string): NavigationSafetySite | null {
+    const normalizedHost = hostname.toLowerCase();
+
+    if (normalizedHost === 'linkedin.com' || normalizedHost.endsWith('.linkedin.com')) {
+      return 'linkedin';
+    }
+    if (normalizedHost === 'instagram.com' || normalizedHost.endsWith('.instagram.com')) {
+      return 'instagram';
+    }
+    if (
+      normalizedHost === 'x.com' ||
+      normalizedHost.endsWith('.x.com') ||
+      normalizedHost === 'twitter.com' ||
+      normalizedHost.endsWith('.twitter.com')
+    ) {
+      return 'x';
+    }
+    if (normalizedHost === 'facebook.com' || normalizedHost.endsWith('.facebook.com')) {
+      return 'facebook';
+    }
+
+    return null;
+  }
+
+  private isNavigationSafetyEnabledForHost(hostname: string): boolean {
+    const navigationSafety = this.config.browser.navigationSafety;
+    if (!navigationSafety.enabled) {
+      return false;
+    }
+
+    const normalizedHost = hostname.toLowerCase();
+    return navigationSafety.protectedSites.some((site) => {
+      const normalizedSite = site.toLowerCase();
+      return normalizedHost === normalizedSite || normalizedHost.endsWith(`.${normalizedSite}`);
+    });
+  }
+
+  private async navigateSessionToUrl(
+    cdpUrl: string,
+    targetId: string,
+    url: string,
+    budget: { remainingMs(): number; signal: AbortSignal }
+  ): Promise<{ url: string; title?: string; readyState?: string }> {
+    const response = await fetch(`${cdpUrl}/json/list`, {
+      signal: budget.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const targets = (await response.json()) as Array<{
+      id: string;
+      webSocketDebuggerUrl?: string;
+    }>;
+    const target = targets.find((candidate) => candidate.id === targetId);
+    if (!target?.webSocketDebuggerUrl) {
+      throw new Error(`Target ${targetId} has no webSocketDebuggerUrl`);
+    }
+
+    const { createCdpSender, openCdpWebSocket, sendWithBudget } = await import('./cdp-helpers.js');
+    const { getBudgetManager } = await import('./budget-manager.js');
+    const budgetManager = getBudgetManager();
+    const connectBudget = budgetManager.createBudget({ timeoutMs: Math.max(1000, budget.remainingMs()) }, budget.signal);
+    const ws = await openCdpWebSocket(target.webSocketDebuggerUrl, connectBudget);
+    connectBudget.cleanup();
+
+    try {
+      const sender = createCdpSender(ws);
+      const runtimeBudget = budgetManager.createBudget({ timeoutMs: Math.max(1000, budget.remainingMs()) }, budget.signal);
+      try {
+        await sendWithBudget(sender, 'Page.enable', undefined, undefined, runtimeBudget);
+        await sendWithBudget(sender, 'Runtime.enable', undefined, undefined, runtimeBudget);
+        await sendWithBudget(sender, 'Page.navigate', { url }, undefined, runtimeBudget);
+        await sendWithBudget(
+          sender,
+          'Runtime.evaluate',
+          {
+            expression: '({ url: window.location.href, title: document.title, readyState: document.readyState })',
+            returnByValue: true,
+            awaitPromise: false,
+          },
+          undefined,
+          runtimeBudget
+        );
+      } finally {
+        runtimeBudget.cleanup();
+      }
+
+      const settleBudget = budgetManager.createBudget({ timeoutMs: Math.max(1000, budget.remainingMs()) }, budget.signal);
+      try {
+        const settled = await sendWithBudget<{ result?: { value?: { url?: string; title?: string; readyState?: string } } }>(
+          sender,
+          'Runtime.evaluate',
+          {
+            expression: `new Promise((resolve) => {
+              const startedAt = Date.now();
+              const sample = () => {
+                const body = document.body;
+                const textLength = (body?.innerText || '').trim().length;
+                const nodeCount = body ? body.querySelectorAll('*').length : 0;
+                const mainLike = !!document.querySelector('main, #main, [role="main"], [data-testid="main"]');
+                const state = {
+                  url: window.location.href,
+                  title: document.title,
+                  readyState: document.readyState,
+                  textLength,
+                  nodeCount,
+                  mainLike,
+                };
+                if (
+                  state.readyState === 'complete' ||
+                  (state.readyState === 'interactive' && state.title && (state.textLength >= 200 || state.mainLike || state.nodeCount >= 25)) ||
+                  Date.now() - startedAt >= ${Math.max(1000, budget.remainingMs())}
+                ) {
+                  resolve(state);
+                  return;
+                }
+                setTimeout(sample, 150);
+              };
+              sample();
+            })`,
+            returnByValue: true,
+            awaitPromise: true,
+          },
+          undefined,
+          settleBudget
+        );
+
+        return {
+          url: settled.result?.value?.url || url,
+          title: settled.result?.value?.title,
+          readyState: settled.result?.value?.readyState,
+        };
+      } finally {
+        settleBudget.cleanup();
+      }
+    } finally {
+      ws.close();
     }
   }
 

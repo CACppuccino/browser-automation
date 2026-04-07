@@ -54,6 +54,17 @@ browser:
     createUrl: about:blank
     enforceOwnership: true
     allowClientTargetOverride: false
+  navigationSafety:
+    enabled: true
+    protectedSites:
+      - linkedin.com
+      - instagram.com
+      - x.com
+      - twitter.com
+      - facebook.com
+    minStartIntervalMs: 5000
+    maxRandomStartupDelayMs: 3000
+    queueDiscipline: fifo
   cleanupIntervalMs: 30000
 
 timeouts:

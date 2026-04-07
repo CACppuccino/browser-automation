@@ -106,6 +106,7 @@ OpenClaw Browser Automation是一个分层的浏览器自动化系统，专为AI
 - **独立进程架构** - 与Gateway解耦，避免影响主服务
 - **动态隔离路由** - 根据负载和agent特征选择隔离级别
 - **ProfileManager** - 统一处理 profile 元数据、路径解析、lock 与 migration
+- **Navigation Safety Queue** - 对受保护社媒站点执行站点级 FIFO 排队、最小启动间隔与随机启动延迟
 - **Dedicated Chrome Profiles** - dedicated 模式可直接挂载完整 `user-data-dir`，保留 cookies / localStorage / cache / IndexedDB / service worker / Chrome profile 状态
 - **Fresh Instance Cleanup** - fresh 模式使用临时 user-data-dir，并在会话释放后清理
 - **完整可观测性** - Prometheus + OpenTelemetry + 结构化日志
@@ -209,6 +210,8 @@ fresh instance:
 - `dedicated + fresh` 会在释放后删除临时目录
 - workspace profile 默认存储在 agent workspace 下，也可迁移到 global scope
 - 同一 workflow 若要保持浏览器身份，除了 `agentId` 外，还需要稳定复用 `stateMode`、`profileId`、`profileScope` 与 `workspacePath`
+- 对 `linkedin.com`、`instagram.com`、`x.com` / `twitter.com`、`facebook.com` 的 `browser_navigate` 默认启用站点级安全限流
+- 限流规则按站点共享 FIFO 队列执行，相邻两次新 URL 导航启动至少间隔 `5s`，且开始前加入 `0~3000ms` 随机延迟
 
 #### Profile Locking 与 Migration
 
@@ -330,7 +333,7 @@ class BudgetManager {
    ↓
 3. 转换为CDP Service API调用
    ↓
-4. HTTP POST /api/v1/evaluate
+4. HTTP POST `/api/v1/evaluate` 或 `/api/v1/navigate`
    ↓
 5. 认证验证 (Bearer token)
    ↓

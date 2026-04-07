@@ -7,6 +7,7 @@ export type BrowserMode = 'shared' | 'dedicated';
 export type BrowserStateMode = 'profile' | 'fresh';
 export type ProfileStorageScope = 'workspace' | 'global';
 export type ProfileMigrationMode = 'copy' | 'move';
+export type NavigationSafetySite = 'linkedin' | 'instagram' | 'x' | 'facebook';
 
 export interface ServiceConfig {
   service: {
@@ -70,6 +71,13 @@ export interface ServiceConfig {
       createUrl: string;
       enforceOwnership: boolean;
       allowClientTargetOverride: boolean;
+    };
+    navigationSafety: {
+      enabled: boolean;
+      protectedSites: string[];
+      minStartIntervalMs: number;
+      maxRandomStartupDelayMs: number;
+      queueDiscipline: 'fifo';
     };
     cleanupIntervalMs: number;
   };
@@ -156,6 +164,12 @@ export interface EvaluateRequest {
   budget: BudgetRequest;
 }
 
+export interface NavigateRequest extends BrowserAccessRequest {
+  url: string;
+  waitForLoad?: boolean;
+  timeoutMs?: number;
+}
+
 export interface EngineEvaluateRequest extends EvaluateRequest {
   agentId: string;
   browserMode: BrowserMode;
@@ -182,6 +196,23 @@ export interface EvaluateResponse {
     browserInstanceId?: string;
     targetId?: string;
     terminatedViaSignal?: boolean;
+  };
+}
+
+export interface NavigateResponse {
+  url: string;
+  title?: string;
+  readyState?: string;
+  metadata: {
+    browserMode?: BrowserMode;
+    stateMode?: BrowserStateMode;
+    browserInstanceId?: string;
+    targetId?: string;
+    rateLimitApplied: boolean;
+    siteBucket?: NavigationSafetySite;
+    queueWaitMs: number;
+    startupDelayMs: number;
+    startedAt: number;
   };
 }
 

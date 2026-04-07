@@ -112,6 +112,23 @@ function validateConfig(config: ServiceConfig): void {
     throw new Error('browser.cleanupIntervalMs must be at least 1000ms');
   }
 
+  const navigationSafety = config.browser.navigationSafety;
+  if (!navigationSafety) {
+    throw new Error('browser.navigationSafety is required');
+  }
+  if (navigationSafety.enabled && navigationSafety.protectedSites.length === 0) {
+    throw new Error('browser.navigationSafety.protectedSites must not be empty when enabled');
+  }
+  if (navigationSafety.minStartIntervalMs < 1000) {
+    throw new Error('browser.navigationSafety.minStartIntervalMs must be at least 1000ms');
+  }
+  if (navigationSafety.maxRandomStartupDelayMs < 0) {
+    throw new Error('browser.navigationSafety.maxRandomStartupDelayMs must be >= 0');
+  }
+  if (navigationSafety.queueDiscipline !== 'fifo') {
+    throw new Error('browser.navigationSafety.queueDiscipline must be fifo');
+  }
+
   const dedicated = config.browser.dedicated;
   if (dedicated.enabled) {
     if (!dedicated.executablePath) {
@@ -226,6 +243,13 @@ export function getDefaultConfig(): ServiceConfig {
         createUrl: 'about:blank',
         enforceOwnership: true,
         allowClientTargetOverride: false,
+      },
+      navigationSafety: {
+        enabled: true,
+        protectedSites: ['linkedin.com', 'instagram.com', 'x.com', 'twitter.com', 'facebook.com'],
+        minStartIntervalMs: 5000,
+        maxRandomStartupDelayMs: 3000,
+        queueDiscipline: 'fifo',
       },
       cleanupIntervalMs: 30000,
     },
