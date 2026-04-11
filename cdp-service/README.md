@@ -1,10 +1,10 @@
 # OpenClaw CDP Service
 
-独立的Chrome DevTools Protocol (CDP) 服务，为OpenClaw提供高性能、可扩展的浏览器自动化能力。
+独立的Chrome DevTools Protocol (CDP) 服务，提供高性能、可扩展的浏览器自动化能力。
 
 ## 概述
 
-CDP服务解决了OpenClaw在多agent并发、操作阻塞和监控缺失等方面的核心问题，提供：
+CDP服务解决了多agent并发、操作阻塞和监控缺失等方面的核心问题，提供：
 
 - ✅ **多Agent并发稳定性** - 独立CDP会话池，避免agent间相互干扰
 - ✅ **解决阻塞问题** - 独立evaluate引擎，避免Playwright队列阻塞
@@ -91,6 +91,7 @@ curl http://localhost:3100/health
 - `shared` 不支持显式选择 `profileId`
 - `dedicated + profile` 需要 `profileId`
 - `profileScope: "workspace"` 时需要绝对路径 `workspacePath`
+- `frameIndex` 仅表示当前顶层页面中的同源 iframe 索引；顶层页面操作时请省略 `frameIndex`
 - `browser.dedicated.headless` 控制 dedicated 实例是否无头运行
 - 默认配置现在是 `headless: false`，也就是有头模式，便于观察执行过程并降低部分站点对无头浏览器的风控命中率
 - 如需恢复无头模式，把 `config.yaml` 或 `config-optimized.yaml` 中的 `browser.dedicated.headless` 改为 `true`
@@ -329,7 +330,7 @@ limits:
     session: 100
 ```
 
-## 集成到OpenClaw
+## 集成到宿主项目
 
 ### 使用客户端库
 

@@ -1,7 +1,7 @@
 /**
  * CDP Service Client
- * HTTP client for OpenClaw CDP Service
- * To be used by openclaw gateway for browser operations
+ * HTTP client for the standalone CDP Service
+ * To be used by host applications for browser operations
  */
 
 export type CdpBrowserMode = 'shared' | 'dedicated';

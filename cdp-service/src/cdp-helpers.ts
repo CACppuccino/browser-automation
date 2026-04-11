@@ -1,6 +1,6 @@
 /**
  * CDP Helpers - Low-level CDP communication utilities
- * Adapted from openclaw/src/browser/cdp.helpers.ts
+ * Adapted from an earlier browser automation implementation
  */
 import WebSocket from 'ws';
 import type { Budget } from './types.js';

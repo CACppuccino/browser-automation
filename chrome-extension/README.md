@@ -32,9 +32,9 @@ Chrome扩展功能处于规划阶段。CDP Service已经通过CDP协议提供了
 ```json
 {
   "manifest_version": 3,
-  "name": "OpenClaw Browser Automation Helper",
+  "name": "Browser Automation Helper",
   "version": "1.0.0",
-  "description": "Enhanced browser automation capabilities for OpenClaw",
+  "description": "Enhanced browser automation capabilities for browser automation workflows",
   "permissions": [
     "debugger",
     "storage",

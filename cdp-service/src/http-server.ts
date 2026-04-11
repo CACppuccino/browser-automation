@@ -132,7 +132,7 @@ export class HttpServer {
       res.json({
         name: 'cdp-service',
         version: '1.0.0',
-        capabilities: ['evaluate', 'snapshot', 'screenshot', 'sessions', 'profiles'],
+        capabilities: ['evaluate', 'navigate', 'snapshot', 'screenshot', 'sessions', 'profiles'],
         isolationLevels: ['process', 'context', 'session'],
         browserModes: ['shared', 'dedicated'],
         stateModes: ['profile', 'fresh'],

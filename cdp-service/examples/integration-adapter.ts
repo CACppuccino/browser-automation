@@ -2,7 +2,7 @@
  * CDP Service Integration Example
  *
  * This file demonstrates how to integrate the CDP service client
- * into OpenClaw's browser-tool.ts implementation
+ * into a host application's browser tool implementation
  */
 
 import { CdpServiceClient, createCdpServiceClient, CdpServiceError } from './client.js';

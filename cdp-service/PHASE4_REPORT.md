@@ -377,7 +377,7 @@ export CDP_SERVICE_ROLLOUT=0
 
 ## 集成清单
 
-### 对于OpenClaw主项目
+### 对于宿主项目
 
 1. **安装CDP服务包**（可选npm包发布）
    ```bash
