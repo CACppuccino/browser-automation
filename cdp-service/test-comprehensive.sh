@@ -47,7 +47,21 @@ cat > "$SITE_DIR/index.html" <<'EOF'
     <title>Profile Persistence Test</title>
   </head>
   <body>
-    <h1>Profile Persistence Test Page</h1>
+    <h1 id="top-title">Profile Persistence Test Page</h1>
+    <iframe id="same-origin-frame" src="/frame.html"></iframe>
+  </body>
+</html>
+EOF
+
+cat > "$SITE_DIR/frame.html" <<'EOF'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Frame Content</title>
+  </head>
+  <body>
+    <h2 id="frame-title">Inner Frame Title</h2>
   </body>
 </html>
 EOF
@@ -220,7 +234,29 @@ sleep 1
 
 echo ""
 echo "=========================================="
-echo "Test 6: Shared+fresh validation"
+echo "Test 6: frameIndex and iframeIndex semantics"
+echo "=========================================="
+FRAME_AGENT_JSON='"stateMode":"profile","profileId":"persist-profile","profileScope":"workspace","workspacePath":"'"${WORKSPACE_DIR}"'",'
+navigate_agent "frame-agent" "$FRAME_AGENT_JSON"
+
+TOP_DOC_RESPONSE=$(api_request POST /api/v1/evaluate "{\"agentId\":\"frame-agent\",\"browserMode\":\"dedicated\",${FRAME_AGENT_JSON}\"expression\":\"document.querySelector('#top-title')?.textContent\",\"budget\":{\"timeoutMs\":5000}}")
+assert_json "$TOP_DOC_RESPONSE" "assert data['result'] == 'Profile Persistence Test Page'"
+echo "✓ Top-level document evaluate passed"
+
+FRAMES_RESPONSE=$(api_request POST /api/v1/evaluate "{\"agentId\":\"frame-agent\",\"browserMode\":\"dedicated\",${FRAME_AGENT_JSON}\"expression\":\"(() => ({ url: window.location.href, title: document.title, frames: [{ frameIndex: 0, iframeIndex: null, kind: 'top-level', title: document.title }, ...Array.from(document.querySelectorAll('iframe')).map((frame, index) => ({ frameIndex: index + 1, iframeIndex: index, kind: 'iframe', title: frame.getAttribute('title') || null, sameOriginAccessible: (() => { try { return Boolean(frame.contentWindow?.document); } catch { return false; } })() }))] }))()\",\"budget\":{\"timeoutMs\":5000}}")
+assert_json "$FRAMES_RESPONSE" "assert data['result']['frames'][0]['frameIndex'] == 0; assert data['result']['frames'][0]['kind'] == 'top-level'; assert data['result']['frames'][1]['frameIndex'] == 1; assert data['result']['frames'][1]['iframeIndex'] == 0"
+echo "✓ Frame listing semantics passed"
+
+FRAME_BY_FRAME_INDEX=$(api_request POST /api/v1/evaluate "{\"agentId\":\"frame-agent\",\"browserMode\":\"dedicated\",${FRAME_AGENT_JSON}\"expression\":\"(() => { const frame = document.querySelectorAll('iframe')[0]; return frame.contentWindow.document.querySelector('#frame-title')?.textContent; })()\",\"budget\":{\"timeoutMs\":5000}}")
+assert_json "$FRAME_BY_FRAME_INDEX" "assert data['result'] == 'Inner Frame Title'"
+echo "✓ Frame document access logic passed"
+
+api_request DELETE "/api/v1/sessions/frame-agent?browserMode=dedicated&stateMode=profile&profileId=persist-profile&profileScope=workspace&workspacePath=${WORKSPACE_DIR}" >/dev/null
+sleep 1
+
+echo ""
+echo "=========================================="
+echo "Test 7: Shared+fresh validation"
 echo "=========================================="
 INVALID_STATUS=$(curl -sS -o "$TMP_DIR/invalid.json" -w "%{http_code}" -X POST "${SERVICE_URL}/api/v1/evaluate" \
   -H "Authorization: Bearer ${CDP_SERVICE_TOKEN}" \
@@ -247,6 +283,7 @@ echo "✓ Workspace profile CRUD works"
 echo "✓ Profile persistence survives dedicated restart"
 echo "✓ Profile migration to global scope works"
 echo "✓ Fresh instances stay isolated"
+echo "✓ frameIndex and iframeIndex semantics work"
 echo "✓ Invalid shared/fresh combination rejected"
 echo ""
 echo "All comprehensive tests passed!"

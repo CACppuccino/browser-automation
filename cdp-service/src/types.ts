@@ -168,6 +168,7 @@ export interface NavigateRequest extends BrowserAccessRequest {
   url: string;
   waitForLoad?: boolean;
   timeoutMs?: number;
+  frameIndex?: number;
 }
 
 export interface EngineEvaluateRequest extends EvaluateRequest {

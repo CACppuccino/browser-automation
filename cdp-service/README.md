@@ -91,7 +91,8 @@ curl http://localhost:3100/health
 - `shared` 不支持显式选择 `profileId`
 - `dedicated + profile` 需要 `profileId`
 - `profileScope: "workspace"` 时需要绝对路径 `workspacePath`
-- `frameIndex` 仅表示当前顶层页面中的同源 iframe 索引；顶层页面操作时请省略 `frameIndex`
+- `frameIndex` 现在表示 document 层级，取值应来自 `browser_frames`；`0` 表示顶层 document，`1` 表示第一个同源 iframe 的 document
+- `iframeIndex` 用于直接选择当前顶层页面中的同源 iframe，下标从 `0` 开始
 - `browser.dedicated.headless` 控制 dedicated 实例是否无头运行
 - 默认配置现在是 `headless: false`，也就是有头模式，便于观察执行过程并降低部分站点对无头浏览器的风控命中率
 - 如需恢复无头模式，把 `config.yaml` 或 `config-optimized.yaml` 中的 `browser.dedicated.headless` 改为 `true`
@@ -187,6 +188,12 @@ curl http://localhost:3100/api/v1/stats \
   "requestsPerSecond": 0.34
 }
 ```
+
+#### 请求与错误日志
+
+- 服务会记录每次 HTTP 请求的 `method`、`path`、`query` 与脱敏后的 `body`
+- evaluate / navigate 失败时会记录对应错误及脱敏后的请求体
+- `token`、`authorization`、`cookie`、`password` 等敏感字段会自动打码
 
 ## 配置
 

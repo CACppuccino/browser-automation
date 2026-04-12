@@ -58,10 +58,12 @@ export class HttpServer {
     // Request logging
     this.app.use((req, _res, next) => {
       const logger = getLogger();
-      logger.debug('Incoming request', {
+      logger.info('Incoming request', {
         method: req.method,
         path: req.path,
         ip: req.ip,
+        query: req.query,
+        body: this.sanitizeLogValue(req.body),
       });
       next();
     });
@@ -519,7 +521,10 @@ export class HttpServer {
           requestBudget.cleanup();
         }
       } catch (error) {
-        logger.error('Evaluate failed', error);
+        logger.error('Evaluate failed', error, {
+          path: req.path,
+          body: this.sanitizeLogValue(req.body),
+        });
 
         const message = error instanceof Error ? error.message : 'Unknown error';
         const statusCode = this.isClientError(message) ? 400 : 500;
@@ -553,6 +558,14 @@ export class HttpServer {
           res.status(400).json({
             error: 'Bad Request',
             message: 'url must be a valid absolute URL',
+          });
+          return;
+        }
+
+        if (request.frameIndex !== undefined && (!Number.isInteger(request.frameIndex) || request.frameIndex < 0)) {
+          res.status(400).json({
+            error: 'Bad Request',
+            message: 'frameIndex must be a non-negative integer returned by browser_frames',
           });
           return;
         }
@@ -618,6 +631,18 @@ export class HttpServer {
           let startupDelayMs = 0;
           let startedAt = Date.now();
 
+          logger.info('Navigate request', {
+            agentId,
+            requestedUrl: request.url,
+            frameIndex: request.frameIndex ?? 0,
+            browserMode,
+            stateMode: session.stateMode,
+            profileId: session.profileId,
+            browserInstanceId: session.browserInstanceId,
+            targetId: session.targetId,
+            timeoutMs,
+          });
+
           if (siteBucket && this.isNavigationSafetyEnabledForHost(requestedUrl.hostname)) {
             const permitBudget = budgetManager.propagateBudget(requestBudget, 100);
             try {
@@ -638,7 +663,14 @@ export class HttpServer {
           try {
             const response = await queueManager.enqueue(
               session.targetId,
-              () => this.navigateSessionToUrl(session.cdpUrl, session.targetId, request.url, navigateBudget),
+              () =>
+                this.navigateSessionToUrl(
+                  session.cdpUrl,
+                  session.targetId,
+                  request.url,
+                  navigateBudget,
+                  request.frameIndex
+                ),
               navigateBudget
             );
 
@@ -663,6 +695,7 @@ export class HttpServer {
               agentId,
               requestedUrl: request.url,
               finalUrl: payload.url,
+              frameIndex: request.frameIndex ?? 0,
               browserMode: session.browserMode,
               stateMode: session.stateMode,
               profileId: session.profileId,
@@ -682,7 +715,10 @@ export class HttpServer {
           requestBudget.cleanup();
         }
       } catch (error) {
-        logger.error('Navigate failed', error);
+        logger.error('Navigate failed', error, {
+          path: req.path,
+          body: this.sanitizeLogValue(req.body),
+        });
         const message = error instanceof Error ? error.message : 'Unknown error';
         const statusCode = this.isClientError(message) ? 400 : 500;
 
@@ -855,7 +891,8 @@ export class HttpServer {
     cdpUrl: string,
     targetId: string,
     url: string,
-    budget: { remainingMs(): number; signal: AbortSignal }
+    budget: { remainingMs(): number; signal: AbortSignal },
+    frameIndex = 0
   ): Promise<{ url: string; title?: string; readyState?: string }> {
     const response = await fetch(`${cdpUrl}/json/list`, {
       signal: budget.signal,
@@ -887,6 +924,53 @@ export class HttpServer {
       try {
         await sendWithBudget(sender, 'Page.enable', undefined, undefined, runtimeBudget);
         await sendWithBudget(sender, 'Runtime.enable', undefined, undefined, runtimeBudget);
+
+        if (frameIndex > 0) {
+          const frameNavigation = await sendWithBudget<{ result?: { value?: { url?: string; title?: string; readyState?: string } } }>(
+            sender,
+            'Runtime.evaluate',
+            {
+              expression: `(() => {
+                const frameIndex = ${JSON.stringify(frameIndex)};
+                const iframeIndex = frameIndex - 1;
+                const frames = document.querySelectorAll('iframe');
+                const frame = frames[iframeIndex];
+                if (!frame) {
+                  if (frames.length === 0) {
+                    throw new Error('Iframe not found for frameIndex=' + frameIndex + ' (page has no same-origin iframe candidates; use frameIndex=0 for the top-level document)');
+                  }
+                  throw new Error('Iframe not found for frameIndex=' + frameIndex + ' (available iframe count=' + frames.length + '; use frameIndex=0 for the top-level document)');
+                }
+                const frameWindow = frame.contentWindow;
+                const frameDocument = frameWindow?.document;
+                if (!frameWindow || !frameDocument) {
+                  throw new Error('Iframe for frameIndex=' + frameIndex + ' is not accessible (likely cross-origin or not loaded; use frameIndex=0 for the top-level document)');
+                }
+                frameWindow.location.href = ${JSON.stringify(url)};
+                return {
+                  url: frameWindow.location.href,
+                  title: frameDocument.title,
+                  readyState: frameDocument.readyState,
+                };
+              })()`,
+              returnByValue: true,
+              awaitPromise: false,
+            },
+            undefined,
+            runtimeBudget
+          );
+
+          const frameResult = frameNavigation.result?.value as
+            | { url?: string; title?: string; readyState?: string }
+            | undefined;
+
+          return {
+            url: frameResult?.url || url,
+            title: frameResult?.title,
+            readyState: frameResult?.readyState,
+          };
+        }
+
         await sendWithBudget(sender, 'Page.navigate', { url }, undefined, runtimeBudget);
         await sendWithBudget(
           sender,
@@ -954,6 +1038,39 @@ export class HttpServer {
     } finally {
       ws.close();
     }
+  }
+
+  private sanitizeLogValue(value: unknown): unknown {
+    if (value === null || value === undefined) {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitizeLogValue(item));
+    }
+
+    if (typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, entryValue]) => {
+          const normalizedKey = key.toLowerCase();
+          if (
+            normalizedKey.includes('token') ||
+            normalizedKey.includes('authorization') ||
+            normalizedKey.includes('cookie') ||
+            normalizedKey.includes('password')
+          ) {
+            return [key, '[REDACTED]'];
+          }
+          return [key, this.sanitizeLogValue(entryValue)];
+        })
+      );
+    }
+
+    if (typeof value === 'string' && value.length > 1000) {
+      return `${value.slice(0, 1000)}…[truncated]`;
+    }
+
+    return value;
   }
 
   private isClientError(message: string): boolean {

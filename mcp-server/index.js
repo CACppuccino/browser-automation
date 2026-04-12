@@ -255,7 +255,11 @@ const browserAccessProperties = {
   },
   frameIndex: {
     type: 'number',
-    description: 'Optional iframe index to operate within when the frame is same-origin',
+    description: 'Optional same-origin frame document index from browser_frames; frameIndex 0 targets the top-level document',
+  },
+  iframeIndex: {
+    type: 'number',
+    description: 'Optional direct same-origin iframe index within the current top-level document; use this for first-level iframe selection only',
   },
 };
 
@@ -594,35 +598,97 @@ function literal(value) {
   return JSON.stringify(String(value));
 }
 
-function buildFrameScopePrelude(frameIndex) {
+function validateDocumentFrameIndex(frameIndex) {
   if (frameIndex === undefined || frameIndex === null) {
+    return;
+  }
+
+  if (!Number.isInteger(frameIndex) || frameIndex < 0) {
+    throw new Error('frameIndex must be a non-negative integer returned by browser_frames; frameIndex=0 targets the top-level document');
+  }
+}
+
+function validateIframeIndex(iframeIndex) {
+  if (iframeIndex === undefined || iframeIndex === null) {
+    return;
+  }
+
+  if (!Number.isInteger(iframeIndex) || iframeIndex < 0) {
+    throw new Error('iframeIndex must be a non-negative integer selecting a same-origin iframe within the current top-level document');
+  }
+}
+
+function resolveFrameSelection(args = {}) {
+  const frameIndex = args.frameIndex;
+  const iframeIndex = args.iframeIndex;
+
+  if (frameIndex !== undefined && frameIndex !== null && iframeIndex !== undefined && iframeIndex !== null) {
+    throw new Error('Provide either frameIndex or iframeIndex, not both');
+  }
+
+  if (frameIndex !== undefined && frameIndex !== null) {
+    validateDocumentFrameIndex(frameIndex);
+    return {
+      frameIndex: Number(frameIndex),
+      iframeIndex: frameIndex === 0 ? null : Number(frameIndex) - 1,
+      scope: frameIndex === 0 ? 'top-level' : 'iframe',
+    };
+  }
+
+  if (iframeIndex !== undefined && iframeIndex !== null) {
+    validateIframeIndex(iframeIndex);
+    return {
+      frameIndex: Number(iframeIndex) + 1,
+      iframeIndex: Number(iframeIndex),
+      scope: 'iframe',
+    };
+  }
+
+  return {
+    frameIndex: 0,
+    iframeIndex: null,
+    scope: 'top-level',
+  };
+}
+
+function buildFrameScopePrelude(frameIndex) {
+  validateDocumentFrameIndex(frameIndex);
+
+  if (frameIndex === undefined || frameIndex === null || Number(frameIndex) === 0) {
     return '';
   }
 
+  const iframeIndex = Number(frameIndex) - 1;
+
   return `
     const __frameIndex = ${Number(frameIndex)};
-    const __frameElement = document.querySelectorAll('iframe')[__frameIndex];
+    const __iframeIndex = ${iframeIndex};
+    const __iframeElements = document.querySelectorAll('iframe');
+    const __frameElement = __iframeElements[__iframeIndex];
     if (!__frameElement) {
-      throw new Error('Iframe not found at frameIndex=' + __frameIndex);
+      if (__iframeElements.length === 0) {
+        throw new Error('Iframe not found for frameIndex=' + __frameIndex + ' (page has no same-origin iframe candidates; use frameIndex=0 for the top-level document)');
+      }
+      throw new Error('Iframe not found for frameIndex=' + __frameIndex + ' (available iframe count=' + __iframeElements.length + '; use frameIndex=0 for the top-level document)');
     }
     const __frameWindow = __frameElement.contentWindow;
     const __frameDocument = __frameWindow?.document;
     if (!__frameWindow || !__frameDocument) {
-      throw new Error('Iframe at frameIndex=' + __frameIndex + ' is not accessible (likely cross-origin or not loaded)');
+      throw new Error('Iframe for frameIndex=' + __frameIndex + ' is not accessible (likely cross-origin or not loaded; use frameIndex=0 for the top-level document)');
     }
   `;
 }
 
 function buildDocumentAccessor(frameIndex) {
-  return frameIndex === undefined || frameIndex === null ? 'document' : '__frameDocument';
+  return frameIndex === undefined || frameIndex === null || Number(frameIndex) === 0 ? 'document' : '__frameDocument';
 }
 
 function buildWindowAccessor(frameIndex) {
-  return frameIndex === undefined || frameIndex === null ? 'window' : '__frameWindow';
+  return frameIndex === undefined || frameIndex === null || Number(frameIndex) === 0 ? 'window' : '__frameWindow';
 }
 
 function buildLocationAccessor(frameIndex) {
-  return frameIndex === undefined || frameIndex === null ? 'window.location' : '__frameWindow.location';
+  return frameIndex === undefined || frameIndex === null || Number(frameIndex) === 0 ? 'window.location' : '__frameWindow.location';
 }
 
 function sleep(ms) {
@@ -963,25 +1029,41 @@ function buildListFramesExpression() {
     (() => ({
       url: window.location.href,
       title: document.title,
-      frames: Array.from(document.querySelectorAll('iframe')).map((frame, index) => {
-        const sameOriginAccessible = (() => {
-          try {
-            return Boolean(frame.contentWindow?.document);
-          } catch {
-            return false;
-          }
-        })();
-        return {
-          index,
-          id: frame.id || null,
-          name: frame.getAttribute('name') || null,
-          title: frame.getAttribute('title') || null,
-          src: frame.getAttribute('src') || null,
-          loading: frame.getAttribute('loading') || null,
-          visible: !!(frame.offsetWidth || frame.offsetHeight || frame.getClientRects().length),
-          sameOriginAccessible,
-        };
-      })
+      frames: [
+        {
+          frameIndex: 0,
+          iframeIndex: null,
+          kind: 'top-level',
+          id: null,
+          name: null,
+          title: document.title || null,
+          src: window.location.href,
+          loading: null,
+          visible: true,
+          sameOriginAccessible: true,
+        },
+        ...Array.from(document.querySelectorAll('iframe')).map((frame, index) => {
+          const sameOriginAccessible = (() => {
+            try {
+              return Boolean(frame.contentWindow?.document);
+            } catch {
+              return false;
+            }
+          })();
+          return {
+            frameIndex: index + 1,
+            iframeIndex: index,
+            kind: 'iframe',
+            id: frame.id || null,
+            name: frame.getAttribute('name') || null,
+            title: frame.getAttribute('title') || null,
+            src: frame.getAttribute('src') || null,
+            loading: frame.getAttribute('loading') || null,
+            visible: !!(frame.offsetWidth || frame.offsetHeight || frame.getClientRects().length),
+            sameOriginAccessible,
+          };
+        })
+      ]
     }))()
   `;
 }
@@ -1097,13 +1179,18 @@ async function evaluateWithBrowserMode(args, expression, timeoutMs, extra = {}) 
 }
 
 async function handleBrowserSnapshot(args) {
+  const frameSelection = resolveFrameSelection(args);
   const wantsContent = args.expandSelector || args.fullContent;
 
   if (!wantsContent) {
-    const result = await evaluateWithBrowserMode(args, buildOutlineExpression(args), 15000);
+    const result = await evaluateWithBrowserMode(
+      args,
+      buildOutlineExpression({ ...args, frameIndex: frameSelection.frameIndex }),
+      15000
+    );
     const response = result.result;
 
-    if (args.includeCookies && (args.frameIndex === undefined || args.frameIndex === null)) {
+    if (args.includeCookies && frameSelection.scope === 'top-level') {
       const cookieResult = await evaluateWithBrowserMode(args, 'document.cookie', 5000);
       response.cookies = cookieResult.result;
     }
@@ -1118,7 +1205,7 @@ async function handleBrowserSnapshot(args) {
     includeHidden: args.includeHidden,
     includeSvg: args.includeSvg,
     includeHead: args.includeHead,
-    frameIndex: args.frameIndex,
+    frameIndex: frameSelection.frameIndex,
   };
 
   const result = await evaluateWithBrowserMode(args, buildContentExpression(contentOpts), 20000);
@@ -1133,6 +1220,7 @@ async function handleBrowserSnapshot(args) {
     title,
     selector,
     frameIndex,
+    iframeIndex: frameSelection.iframeIndex,
     content: windowed.content,
     window: windowed.window,
     contentStats: {
@@ -1143,7 +1231,7 @@ async function handleBrowserSnapshot(args) {
     },
   };
 
-  if (args.includeCookies && (args.frameIndex === undefined || args.frameIndex === null)) {
+  if (args.includeCookies && frameSelection.scope === 'top-level') {
     const cookieResult = await evaluateWithBrowserMode(args, 'document.cookie', 5000);
     response.cookies = cookieResult.result;
   }
@@ -1157,9 +1245,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case 'browser_evaluate': {
-        const expression = args.frameIndex === undefined || args.frameIndex === null
+        const frameSelection = resolveFrameSelection(args);
+        const expression = frameSelection.scope === 'top-level'
           ? args.expression
-          : `(() => { ${buildFrameScopePrelude(args.frameIndex)} return (() => { const document = __frameDocument; const window = __frameWindow; return (${args.expression}); })(); })()`;
+          : `(() => { ${buildFrameScopePrelude(frameSelection.frameIndex)} return (() => { const document = __frameDocument; const window = __frameWindow; return (${args.expression}); })(); })()`;
         const evalResult = await cdpClient.evaluate({
           agentId: args.agentId,
           browserMode: args.browserMode,
@@ -1183,7 +1272,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_navigate': {
-        const state = await cdpClient.navigate(args);
+        const frameSelection = resolveFrameSelection(args);
+        const state = await cdpClient.navigate({
+          ...args,
+          frameIndex: frameSelection.frameIndex,
+        });
         return {
           content: [
             {
@@ -1195,14 +1288,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_click': {
-        await evaluateWithBrowserMode(args, buildClickExpression(args.selector, args.frameIndex), 10000);
+        const frameSelection = resolveFrameSelection(args);
+        await evaluateWithBrowserMode(args, buildClickExpression(args.selector, frameSelection.frameIndex), 10000);
         return {
           content: [{ type: 'text', text: `Clicked element: ${args.selector}` }],
         };
       }
 
       case 'browser_fill': {
-        await evaluateWithBrowserMode(args, buildFillExpression(args.selector, args.value, args.frameIndex), 10000);
+        const frameSelection = resolveFrameSelection(args);
+        await evaluateWithBrowserMode(args, buildFillExpression(args.selector, args.value, frameSelection.frameIndex), 10000);
         return {
           content: [{ type: 'text', text: `Filled ${args.selector} with ${JSON.stringify(args.value)}` }],
         };
@@ -1221,9 +1316,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_extract': {
+        const frameSelection = resolveFrameSelection(args);
         const extracted = await evaluateWithBrowserMode(
           args,
-          buildExtractExpression(args.selectors, args.frameIndex),
+          buildExtractExpression(args.selectors, frameSelection.frameIndex),
           10000
         );
         return {
@@ -1249,9 +1345,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'browser_wait': {
+        const frameSelection = resolveFrameSelection(args);
         await evaluateWithBrowserMode(
           args,
-          buildWaitExpression(args),
+          buildWaitExpression({ ...args, frameIndex: frameSelection.frameIndex }),
           (args.timeoutMs || 30000) + 1000
         );
         return {
